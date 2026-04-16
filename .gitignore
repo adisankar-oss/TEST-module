@@ -1,5 +1,11 @@
-.venv/
-__pycache__/
-.env
-_tmp_req/
-*.log
+__pycache__/ 
+*.py[cod] 
+.venv/ 
+venv/ 
+.env 
+.env.local 
+*.db 
+*.sqlite 
+.pytest_cache/ 
+_tmp_req/ 
+config.json 
