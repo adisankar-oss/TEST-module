@@ -1,85 +1,18 @@
 from __future__ import annotations
 
+import asyncio
 import json
-from statistics import mean
+from collections import Counter
 from typing import Any
 
+from ai.duplicate_checker import is_duplicate_question
+from ai.llm_client import ask_llm
+from ai.topic_selector import choose_topic
 from services.ai_client import AIClient
 from utils.logger import get_logger
 
 
-SOFT_SKILL_OPENERS = [
-    "Tell me about yourself and the kind of problems you have been solving recently.",
-    "Describe a challenging situation at work and how you handled it.",
-    "Tell me about a time you had to make a difficult decision with incomplete information.",
-]
-
-ROLE_FALLBACK_QUESTIONS: dict[str, dict[str, list[str]]] = {
-    "backend": {
-        "behavioral": [
-            "Tell me about a time you had to coordinate a backend change across multiple teams.",
-            "Describe a situation where a production issue forced you to balance speed and correctness.",
-        ],
-        "technical": [
-            "How would you design an API that remains reliable under heavy concurrent traffic?",
-            "How do you investigate and fix a production latency issue in a backend service?",
-            "What tradeoffs would you consider when choosing between strong consistency and availability?",
-        ],
-        "problem_solving": [
-            "You see rising database latency after a feature launch. How would you isolate the root cause?",
-            "How would you redesign a failing queue-based workflow to improve reliability and observability?",
-        ],
-    },
-    "frontend": {
-        "behavioral": [
-            "Tell me about a time you had to defend a UX decision with limited data.",
-            "Describe a situation where you had to balance product pressure against frontend quality.",
-        ],
-        "technical": [
-            "How would you structure state management for a complex, data-heavy frontend application?",
-            "How do you diagnose a rendering performance regression that only appears in production?",
-        ],
-        "problem_solving": [
-            "A page becomes slow after adding several widgets. How would you narrow down the cause?",
-            "How would you handle partial API failures in a user-facing workflow without confusing users?",
-        ],
-    },
-    "data": {
-        "behavioral": [
-            "Describe a time you had to challenge an assumption in a data-driven decision.",
-            "Tell me about a situation where bad data changed the direction of a project.",
-        ],
-        "technical": [
-            "How would you design a pipeline that handles delayed and malformed events reliably?",
-            "How do you validate data quality before downstream models or reports consume the data?",
-        ],
-        "problem_solving": [
-            "A key metric suddenly drops. How would you determine whether the issue is product-related or data-related?",
-            "How would you debug a recurring pipeline failure that happens only under peak load?",
-        ],
-    },
-    "general": {
-        "behavioral": [
-            "Tell me about a time you had to earn trust quickly on a new project.",
-            "Describe a situation where your first approach failed and what you changed next.",
-        ],
-        "technical": [
-            "Walk me through how you break down a complex problem when the path forward is not obvious.",
-            "How do you decide when a quick fix is acceptable versus when a deeper redesign is necessary?",
-        ],
-        "problem_solving": [
-            "You inherit a process that is failing unpredictably. How would you stabilize it?",
-            "How would you investigate a problem when the available signals are incomplete or conflicting?",
-        ],
-    },
-}
-
-ROLE_KEYWORDS: dict[str, tuple[str, ...]] = {
-    "backend": ("backend", "api", "python", "java", "node", "service"),
-    "frontend": ("frontend", "ui", "web", "react", "angular", "vue"),
-    "data": ("data", "ml", "analytics", "etl", "pipeline", "ai"),
-}
-
+FALLBACK_QUESTION = "Tell me about a challenging system you worked on and the trade-offs you had to make?"
 FOLLOWUP_BANNED_PHRASES = (
     "explain deeper",
     "improve your answer",
@@ -88,6 +21,20 @@ FOLLOWUP_BANNED_PHRASES = (
     "previous question",
     "as I asked before",
 )
+TRACKED_CONCEPTS = ("async", "api", "database", "cache", "auth", "scaling")
+ROLE_KEYWORDS: dict[str, tuple[str, ...]] = {
+    "backend": ("backend", "api", "python", "java", "node", "service"),
+    "frontend": ("frontend", "ui", "web", "react", "angular", "vue"),
+    "data": ("data", "ml", "analytics", "etl", "pipeline", "ai"),
+}
+CONCEPT_TOPIC_MAP = {
+    "async": "technical_skills",
+    "api": "technical_skills",
+    "database": "technical_skills",
+    "cache": "problem_solving",
+    "auth": "technical_skills",
+    "scaling": "problem_solving",
+}
 
 
 class QuestionService:
@@ -104,29 +51,30 @@ class QuestionService:
     ) -> str:
         role = self.resolve_role(job_id)
         fallback = (
-            "Hi, I'm Alex, and I'll be your interviewer today. "
-            "We'll start with a few questions about your experience and then move into role-specific topics. "
-            "Take your time, and let's begin."
+            f"Hi {candidate_id}, it is good to meet you. "
+            f"I'm Alex, and I'll be your interviewer today for the {role} role. "
+            "We'll cover a mix of technical and behavioural topics, and I want this to feel like a real discussion."
         )
 
         try:
             greeting = await self._ai_client.generate_text(
                 system_prompt=(
-                    "You are a professional interviewer. "
-                    "Greet the candidate warmly. Introduce yourself. "
-                    "Explain the interview structure briefly. Keep it natural and professional in 2-3 sentences."
+                    "You are a professional and friendly interviewer representing a top tech company. "
+                    "Your job is to start the interview in a natural, human-like way. "
+                    "Be warm, confident, and professional. Keep it under 120 words, do not output JSON, and end with a question."
                 ),
                 user_prompt=(
-                    f"Candidate identifier: {candidate_id}\n"
-                    f"Role context: {role}\n"
-                    f"Recent context: {json.dumps(context or [], ensure_ascii=True)}\n"
-                    "Return only the greeting."
+                    f"CANDIDATE NAME: {candidate_id}\n"
+                    f"JOB ROLE: {job_id}\n"
+                    "Greet the candidate by name, introduce yourself as interviewer, "
+                    "mention the role, explain that the interview will mix technical and behavioural discussion, "
+                    "and ask a natural opening question."
                 ),
                 temperature=0.4,
                 max_tokens=120,
                 fallback_text=fallback,
             )
-            cleaned = self._clean_text(greeting)
+            cleaned = self._clean_question(greeting)
             if cleaned:
                 self._logger.info(
                     json.dumps(
@@ -166,83 +114,131 @@ class QuestionService:
         )
         return fallback
 
-    async def generate_question(
-        self,
-        job_id: str,
-        question_number: int,
-        context: list[dict[str, Any]] | None = None,
-        difficulty_hint: str = "normal",
-    ) -> str:
-        role = self.resolve_role(job_id)
-        context = context or []
-        track = self._question_track(question_number, context)
-        fallback = self._fallback_question(
-            role=role,
-            question_number=question_number,
-            track=track,
-            context=context,
-        )
+    async def generate_question(self, session: Any) -> str:
+        session_id = str(getattr(session, "id", getattr(session, "session_id", "unknown")))
+        job_id = getattr(session, "job_id", "") or ""
+        question_number = int(getattr(session, "current_question_number", 1) or 1)
+        max_questions = int(getattr(session, "max_questions", 1) or 1)
 
-        try:
-            question = await self._ai_client.generate_text(
-                system_prompt=self._question_system_prompt(),
-                user_prompt=self._question_user_prompt(
-                    job_id=job_id,
-                    role=role,
-                    question_number=question_number,
-                    context=context,
-                    difficulty_hint=difficulty_hint,
-                    track=track,
-                ),
-                temperature=0.5,
-                max_tokens=180,
-                fallback_text=fallback,
-            )
-            cleaned = self._clean_question(question)
-            if self._is_valid_question(cleaned, context=context):
-                self._logger.info(
-                    json.dumps(
-                        {
-                            "event": "question_generated",
-                            "job_id": job_id,
-                            "role": role,
-                            "question_number": question_number,
-                            "track": track,
-                            "difficulty": difficulty_hint,
-                            "source": "ai",
-                            "question": cleaned,
-                        }
-                    )
-                )
-                return cleaned
-        except Exception as exc:
-            self._logger.error(
-                json.dumps(
-                    {
-                        "event": "ai_error",
-                        "component": "question_service",
-                        "job_id": job_id,
-                        "question_number": question_number,
-                        "error": str(exc),
-                    }
-                )
-            )
+        memory = self._ensure_memory(session)
+        questions = memory["questions"]
+        previous_questions = [entry.get("question", "") for entry in questions if entry.get("question")]
+        covered_topics = [topic for topic in memory["topics"] if topic]
+        concept_counts = self._concept_counts(questions, memory["concepts"])
+        last_turn = questions[-1] if questions else {}
+        last_answer = self._normalize_text(last_turn.get("answer", ""))
+        last_score = self._coerce_int(last_turn.get("score"))
+        last_answer_concepts = self._extract_concepts(last_answer)
+        followup_anchor = self._choose_followup_anchor(last_answer_concepts, concept_counts)
+
+        selected_topic = choose_topic(question_number, max_questions, covered_topics)
+        if followup_anchor is not None and concept_counts.get(followup_anchor, 0) >= 2:
+            followup_anchor = None
+        if followup_anchor is None:
+            selected_topic = self._force_new_topic(selected_topic, covered_topics)
 
         self._logger.info(
             json.dumps(
                 {
-                    "event": "question_generated",
-                    "job_id": job_id,
-                    "role": role,
+                    "event": "topic_selected",
+                    "session_id": session_id,
                     "question_number": question_number,
-                    "track": track,
-                    "difficulty": difficulty_hint,
-                    "source": "fallback",
-                    "question": fallback,
+                    "topic": selected_topic,
+                    "followup_anchor": followup_anchor,
+                    "used_concepts": dict(concept_counts),
                 }
             )
         )
-        return fallback
+
+        prompt = self._build_dynamic_prompt(
+            job_id=job_id,
+            question_number=question_number,
+            max_questions=max_questions,
+            selected_topic=selected_topic,
+            previous_questions=previous_questions,
+            last_turns=questions[-3:],
+            last_answer=last_answer,
+            last_score=last_score,
+            covered_topics=covered_topics,
+            used_concepts=memory["concepts"],
+            followup_anchor=followup_anchor,
+        )
+
+        try:
+            raw_response = await asyncio.wait_for(asyncio.to_thread(ask_llm, prompt), timeout=2.0)
+            parsed = self._parse_llm_json(raw_response)
+            candidate_question = self._clean_question(parsed.get("question", ""))
+            question_type = str(parsed.get("type", "new")).strip().lower()
+            question_topic = str(parsed.get("topic", selected_topic)).strip() or selected_topic
+
+            if len(candidate_question) <= 10:
+                raise ValueError("Generated question was too short")
+            if is_duplicate_question(candidate_question, previous_questions):
+                self._logger.warning(
+                    json.dumps(
+                        {
+                            "event": "duplicate_detection",
+                            "session_id": session_id,
+                            "question": candidate_question,
+                            "result": "duplicate",
+                        }
+                    )
+                )
+                raise ValueError("Generated question duplicated prior history")
+            if self._contains_overused_concept(candidate_question, concept_counts):
+                raise ValueError("Generated question reused an overused concept")
+            if question_type == "followup":
+                if followup_anchor is None:
+                    raise ValueError("Model marked follow-up without a valid anchor")
+                if followup_anchor not in candidate_question.lower():
+                    raise ValueError("Follow-up question was not anchored to the last answer")
+            if question_type != "followup" and followup_anchor is not None:
+                question_topic = selected_topic
+
+            concepts_in_question = self._extract_concepts(candidate_question)
+            self._store_question_memory(
+                session=session,
+                memory=memory,
+                question=candidate_question,
+                topic=question_topic,
+                concepts=concepts_in_question,
+            )
+
+            self._logger.info(
+                json.dumps(
+                    {
+                        "event": "question_generated",
+                        "session_id": session_id,
+                        "job_id": job_id,
+                        "question_number": question_number,
+                        "type": question_type,
+                        "topic": question_topic,
+                        "question": candidate_question,
+                    }
+                )
+            )
+            return candidate_question
+        except Exception as exc:
+            self._logger.error(
+                json.dumps(
+                    {
+                        "event": "question_generation_failure",
+                        "session_id": session_id,
+                        "job_id": job_id,
+                        "question_number": question_number,
+                        "error": str(exc),
+                        "fallback_question": FALLBACK_QUESTION,
+                    }
+                )
+            )
+            self._store_question_memory(
+                session=session,
+                memory=memory,
+                question=FALLBACK_QUESTION,
+                topic=selected_topic,
+                concepts=self._extract_concepts(FALLBACK_QUESTION),
+            )
+            return FALLBACK_QUESTION
 
     async def generate_followup(
         self,
@@ -252,85 +248,48 @@ class QuestionService:
         evaluation_feedback: str,
         context: list[dict[str, Any]] | None = None,
     ) -> str:
-        original_question = self._normalize_prompt_value(original_question)
-        candidate_answer = self._normalize_prompt_value(candidate_answer)
-        evaluation_feedback = self._normalize_prompt_value(evaluation_feedback)
+        original_question = self._normalize_text(original_question)
+        candidate_answer = self._normalize_text(candidate_answer)
+        evaluation_feedback = self._normalize_text(evaluation_feedback)
         context = context or []
+        anchor = self._choose_followup_anchor(self._extract_concepts(candidate_answer), Counter())
 
-        fallback = self._fallback_followup(
-            original_question=original_question,
-            candidate_answer=candidate_answer,
-            evaluation_feedback=evaluation_feedback,
-        )
+        if not all((original_question, candidate_answer, evaluation_feedback)) or anchor is None:
+            return FALLBACK_QUESTION
 
-        if not all((original_question, candidate_answer, evaluation_feedback)):
-            self._logger.info(
-                json.dumps(
-                    {
-                        "event": "followup_triggered",
-                        "source": "fallback",
-                        "reason": "missing_followup_inputs",
-                        "original_question_present": bool(original_question),
-                        "candidate_answer_present": bool(candidate_answer),
-                        "evaluation_feedback_present": bool(evaluation_feedback),
-                        "followup_question": fallback,
-                    }
-                )
-            )
-            return fallback
+        fallback = self._anchored_followup_fallback(anchor)
 
         try:
             followup = await self._ai_client.generate_text(
-                system_prompt=self._followup_system_prompt(),
-                user_prompt=self._followup_user_prompt(
-                    original_question=original_question,
-                    candidate_answer=candidate_answer,
-                    evaluation_feedback=evaluation_feedback,
-                    context=context,
+                system_prompt=(
+                    "You are an expert interviewer. Generate one real follow-up question. "
+                    "A true follow-up must explicitly reference a concept from the candidate's last answer, "
+                    "go deeper into that exact concept, and avoid generic restatement. "
+                    "Return only the question."
+                ),
+                user_prompt=(
+                    f"Original question: {original_question}\n"
+                    f"Candidate answer: {candidate_answer}\n"
+                    f"Evaluation feedback: {evaluation_feedback}\n"
+                    f"Anchor concept: {anchor}\n"
+                    f"Recent context: {json.dumps(context, ensure_ascii=True)}\n"
+                    "If you cannot ask a true anchored follow-up, return an empty string."
                 ),
                 temperature=0.4,
                 max_tokens=120,
                 fallback_text=fallback,
             )
             cleaned = self._clean_question(followup)
-            if self._is_valid_followup(
-                cleaned,
-                original_question=original_question,
-                context=context,
+            if (
+                cleaned
+                and anchor in cleaned.lower()
+                and cleaned.lower() != original_question.lower()
+                and not any(phrase in cleaned.lower() for phrase in FOLLOWUP_BANNED_PHRASES)
             ):
-                self._logger.info(
-                    json.dumps(
-                        {
-                            "event": "followup_triggered",
-                            "source": "ai",
-                            "original_question": original_question,
-                            "followup_question": cleaned,
-                        }
-                    )
-                )
                 return cleaned
-        except Exception as exc:
-            self._logger.error(
-                json.dumps(
-                    {
-                        "event": "ai_error",
-                        "component": "question_service.followup",
-                        "error": str(exc),
-                    }
-                )
-            )
+        except Exception:
+            pass
 
-        self._logger.info(
-            json.dumps(
-                {
-                    "event": "followup_triggered",
-                    "source": "fallback",
-                    "reason": "invalid_or_failed_ai_followup",
-                    "original_question": original_question,
-                    "followup_question": fallback,
-                }
-            )
-        )
         return fallback
 
     def resolve_role(self, job_id: str) -> str:
@@ -340,196 +299,236 @@ class QuestionService:
                 return role
         return "general"
 
-    def _question_track(self, question_number: int, context: list[dict[str, Any]]) -> str:
-        if question_number <= 1:
-            return "soft_skill"
+    def _ensure_memory(self, session: Any) -> dict[str, Any]:
+        config = dict(getattr(session, "config", {}) or {})
+        memory = getattr(session, "memory", None)
+        if not isinstance(memory, dict):
+            memory = dict(config.get("memory", {}) or {})
 
-        if not context:
-            return "behavioral"
+        questions = memory.get("questions")
+        if not isinstance(questions, list):
+            questions = []
 
-        average_score = mean(item.get("score", 5) for item in context)
-        if question_number % 3 == 0:
-            return "problem_solving"
-        if average_score >= 8:
-            return "technical"
-        if average_score <= 5:
-            return "behavioral"
-        return "technical"
+        # Bootstrap from legacy question history if needed.
+        legacy_history = config.get("question_history", [])
+        if isinstance(legacy_history, list):
+            normalized_legacy = [
+                {
+                    "question": entry.get("question", ""),
+                    "answer": entry.get("answer", ""),
+                    "score": entry.get("score"),
+                    "topic": entry.get("topic", ""),
+                }
+                for entry in legacy_history
+                if isinstance(entry, dict) and entry.get("question")
+            ]
+            if len(normalized_legacy) >= len(questions):
+                questions = normalized_legacy
 
-    def _fallback_question(
+        topics = memory.get("topics")
+        if not isinstance(topics, list):
+            topics = [
+                entry.get("topic", "")
+                for entry in questions
+                if isinstance(entry, dict) and entry.get("topic")
+            ]
+
+        concepts = memory.get("concepts")
+        if not isinstance(concepts, list):
+            concepts = []
+            for entry in questions:
+                if not isinstance(entry, dict):
+                    continue
+                concepts.extend(self._extract_concepts(entry.get("question", "")))
+                concepts.extend(self._extract_concepts(entry.get("answer", "")))
+
+        memory = {
+            "questions": questions,
+            "topics": topics,
+            "concepts": concepts,
+        }
+        try:
+            setattr(session, "memory", memory)
+        except Exception:
+            pass
+        config["memory"] = memory
+        if hasattr(session, "config"):
+            session.config = config
+        return memory
+
+    def _store_question_memory(
         self,
         *,
-        role: str,
-        question_number: int,
-        track: str,
-        context: list[dict[str, Any]],
-    ) -> str:
-        previous_questions = {
-            self._normalize_prompt_value(item.get("question", "")).lower()
-            for item in context
-            if item.get("question")
-        }
+        session: Any,
+        memory: dict[str, Any],
+        question: str,
+        topic: str,
+        concepts: list[str],
+    ) -> None:
+        questions = list(memory.get("questions", []))
+        questions.append({"question": question, "answer": "", "score": None, "topic": topic})
+        memory["questions"] = questions[-10:]
+        memory["topics"] = (list(memory.get("topics", [])) + [topic])[-10:]
+        memory["concepts"] = (list(memory.get("concepts", [])) + concepts)[-30:]
 
-        if track == "soft_skill":
-            for question in SOFT_SKILL_OPENERS:
-                if question.lower() not in previous_questions:
-                    return question
-            return SOFT_SKILL_OPENERS[(question_number - 1) % len(SOFT_SKILL_OPENERS)]
+        config = dict(getattr(session, "config", {}) or {})
+        config["memory"] = memory
+        config["question_history"] = [
+            {
+                "question": entry.get("question", ""),
+                "answer": entry.get("answer", ""),
+                "score": entry.get("score"),
+                "topic": entry.get("topic", ""),
+            }
+            for entry in memory["questions"]
+        ]
+        if hasattr(session, "config"):
+            session.config = config
+        try:
+            setattr(session, "memory", memory)
+        except Exception:
+            pass
 
-        bank = ROLE_FALLBACK_QUESTIONS.get(role, ROLE_FALLBACK_QUESTIONS["general"])
-        ordered_tracks = [track, "behavioral", "technical", "problem_solving"]
-        for candidate_track in ordered_tracks:
-            for question in bank.get(candidate_track, []):
-                if question.lower() not in previous_questions:
-                    return question
-
-        merged_bank = []
-        for candidate_track in ("behavioral", "technical", "problem_solving"):
-            merged_bank.extend(bank.get(candidate_track, []))
-        return merged_bank[(max(question_number, 1) - 1) % len(merged_bank)]
-
-    @staticmethod
-    def _clean_text(raw_text: str) -> str:
-        return " ".join((raw_text or "").strip().split())
-
-    def _clean_question(self, raw_text: str) -> str:
-        cleaned = self._clean_text(raw_text)
-        if not cleaned:
-            return ""
-        if not cleaned.endswith("?"):
-            cleaned = f"{cleaned.rstrip('.')}?"
-        return cleaned.replace(" ?", "?")
-
-    def _is_valid_question(self, candidate: str, *, context: list[dict[str, Any]]) -> bool:
-        if not candidate:
-            return False
-        previous_questions = {
-            self._normalize_prompt_value(item.get("question", "")).lower()
-            for item in context
-            if item.get("question")
-        }
-        return candidate.lower() not in previous_questions
-
-    @staticmethod
-    def _question_system_prompt() -> str:
-        return (
-            "You are a professional AI interviewer conducting a live interview. "
-            "Generate exactly one interview question. "
-            "The first question must be a soft-skill or experience-opening question. "
-            "Later questions should mix behavioral, technical, and problem-solving topics. "
-            "Use the candidate's recent answers and scores to adapt depth and difficulty. "
-            "Avoid repetition, avoid meta commentary, and output only the question."
-        )
-
-    def _question_user_prompt(
+    def _build_dynamic_prompt(
         self,
         *,
         job_id: str,
-        role: str,
         question_number: int,
-        context: list[dict[str, Any]],
-        difficulty_hint: str,
-        track: str,
+        max_questions: int,
+        selected_topic: str,
+        previous_questions: list[str],
+        last_turns: list[dict[str, Any]],
+        last_answer: str,
+        last_score: int | None,
+        covered_topics: list[str],
+        used_concepts: list[str],
+        followup_anchor: str | None,
     ) -> str:
         return (
-            f"Job identifier: {job_id}\n"
-            f"Inferred role: {role}\n"
-            f"Question number: {question_number}\n"
-            f"Target track: {track}\n"
-            f"Difficulty target: {difficulty_hint}\n"
-            f"Recent context (last up to 3 interactions):\n{json.dumps(context, ensure_ascii=True)}\n"
-            "Generate one fresh question with natural interviewer tone."
+            "You are a professional technical interviewer conducting a real interview.\n"
+            "Your task is to decide the best next question, not just generate a random one.\n"
+            "Before generating a question, decide:\n"
+            "* Should I follow up on a specific concept from the last answer?\n"
+            "* OR move to a new concept to avoid repetition?\n\n"
+            "Rules:\n"
+            "- A true follow-up must explicitly reference a concept from the last answer.\n"
+            "- If no meaningful anchored follow-up is possible, do not mark the question as follow-up.\n"
+            "- Avoid repeating any previous question or concept.\n"
+            "- If a concept has already been used twice, avoid it.\n"
+            "- Return strict JSON only.\n\n"
+            f"Job ID: {job_id}\n"
+            f"Question Number: {question_number} / {max_questions}\n"
+            f"Selected Topic: {selected_topic}\n"
+            f"Previous Questions: {json.dumps(previous_questions[-10:], ensure_ascii=True)}\n"
+            f"Last Answer Full Text: {last_answer}\n"
+            f"Last 3 Q/A: {json.dumps(last_turns[-3:], ensure_ascii=True)}\n"
+            f"Used Concepts: {json.dumps(used_concepts[-20:], ensure_ascii=True)}\n"
+            f"Covered Topics: {json.dumps(covered_topics[-10:], ensure_ascii=True)}\n"
+            f"Last Score: {json.dumps(last_score)}\n"
+            f"Follow-up Anchor: {json.dumps(followup_anchor)}\n\n"
+            "Return JSON with exactly these fields:\n"
+            "{\n"
+            '  "question": "string",\n'
+            '  "type": "followup | new | easier | harder",\n'
+            '  "topic": "technical_skills | problem_solving | behavioural | culture_fit | background",\n'
+            '  "reasoning": "short internal reasoning"\n'
+            "}"
         )
+
+    def _parse_llm_json(self, raw_text: str) -> dict[str, Any]:
+        trimmed = (raw_text or "").strip()
+        start = trimmed.find("{")
+        end = trimmed.rfind("}")
+        if start == -1 or end == -1 or end <= start:
+            raise ValueError("LLM response did not contain JSON")
+        parsed = json.loads(trimmed[start : end + 1])
+        if not isinstance(parsed, dict):
+            raise ValueError("LLM response JSON was not an object")
+        if not parsed.get("question"):
+            raise ValueError("LLM response did not include a question")
+        return parsed
+
+    def _choose_followup_anchor(
+        self,
+        last_answer_concepts: list[str],
+        concept_counts: Counter[str],
+    ) -> str | None:
+        for concept in last_answer_concepts:
+            if concept_counts.get(concept, 0) < 2:
+                return concept
+        return None
 
     @staticmethod
-    def _followup_system_prompt() -> str:
-        return (
-            "You are an expert technical interviewer.\n"
-            "Generate ONE high-quality follow-up question based on a candidate's previous answer.\n"
-            "STRICT RULES:\n"
-            "- Do NOT repeat or rephrase the previous question.\n"
-            "- Do NOT include phrases like 'explain more', 'explain deeper', or similar meta-instructions.\n"
-            "- Do NOT recursively reference earlier follow-ups.\n"
-            "- Identify the missing detail and ask a specific, concrete question.\n"
-            "- Output only the follow-up question."
-        )
+    def _force_new_topic(selected_topic: str, covered_topics: list[str]) -> str:
+        ordered_topics = [
+            "background",
+            "behavioural",
+            "technical_skills",
+            "problem_solving",
+            "culture_fit",
+        ]
+        for topic in ordered_topics:
+            if topic != selected_topic and topic not in covered_topics:
+                return topic
+        return selected_topic
 
-    def _followup_user_prompt(
+    def _contains_overused_concept(
         self,
-        *,
-        original_question: str,
-        candidate_answer: str,
-        evaluation_feedback: str,
-        context: list[dict[str, Any]],
-    ) -> str:
-        return (
-            "Original Question:\n"
-            f"{original_question}\n\n"
-            "Candidate Answer:\n"
-            f"{candidate_answer}\n\n"
-            "Evaluation Feedback:\n"
-            f"{evaluation_feedback}\n\n"
-            "Recent Context:\n"
-            f"{json.dumps(context, ensure_ascii=True)}\n\n"
-            "Return ONLY a follow-up question."
-        )
-
-    @staticmethod
-    def _normalize_prompt_value(value: str) -> str:
-        return " ".join((value or "").strip().split())
-
-    def _is_valid_followup(
-        self,
-        candidate: str,
-        *,
-        original_question: str,
-        context: list[dict[str, Any]],
+        question: str,
+        concept_counts: Counter[str],
     ) -> bool:
-        if not candidate:
-            return False
+        question_concepts = self._extract_concepts(question)
+        return any(concept_counts.get(concept, 0) >= 2 for concept in question_concepts)
 
-        normalized_candidate = candidate.strip().lower()
-        normalized_original = self._normalize_prompt_value(original_question).lower()
-
-        if normalized_candidate == normalized_original:
-            return False
-        if normalized_original and normalized_candidate in normalized_original:
-            return False
-        if any(phrase in normalized_candidate for phrase in FOLLOWUP_BANNED_PHRASES):
-            return False
-
-        previous_questions = {
-            self._normalize_prompt_value(item.get("question", "")).lower()
-            for item in context
-            if item.get("question")
-        }
-        return normalized_candidate not in previous_questions
-
-    def _fallback_followup(
+    def _concept_counts(
         self,
-        *,
-        original_question: str,
-        candidate_answer: str,
-        evaluation_feedback: str,
-    ) -> str:
-        feedback = evaluation_feedback.lower()
-        question = original_question.lower()
-        answer = candidate_answer.lower()
+        questions: list[dict[str, Any]],
+        stored_concepts: list[str],
+    ) -> Counter[str]:
+        counts: Counter[str] = Counter()
+        for concept in stored_concepts:
+            if concept in TRACKED_CONCEPTS:
+                counts[concept] += 1
+        for entry in questions:
+            if not isinstance(entry, dict):
+                continue
+            for concept in self._extract_concepts(entry.get("answer", "")):
+                counts[concept] += 1
+            for concept in self._extract_concepts(entry.get("question", "")):
+                counts[concept] += 1
+        return counts
 
-        if "example" in feedback or "specific" in feedback:
-            return "Can you give a specific example from your own work that demonstrates that approach and its outcome?"
-        if "tradeoff" in feedback or "trade-off" in feedback:
-            return "What tradeoff did you make in that approach, and what made that tradeoff acceptable?"
-        if "performance" in feedback or "latency" in feedback or "scal" in feedback:
-            return "Which metrics would you check first, and how would those metrics shape your next step?"
-        if "database" in feedback or "consistency" in feedback or "reliability" in feedback:
-            return "How would you handle failure scenarios in that design while keeping the data correct?"
-        if "behavior" in question or "conflict" in question or "team" in question:
-            return "What was the hardest part of aligning other people in that situation, and how did you handle it?"
-        if "architecture" in question or "design" in question or "system" in question or "api" in question:
-            return "What was the most important design decision in that system, and what alternative did you reject?"
-        if "clarity" in feedback or "depth" in feedback or "detail" in feedback:
-            return "What was the first concrete step you took, and what evidence told you it was the right one?"
-        if answer:
-            return "What constraint or failure case most influenced your approach, and how did you account for it?"
-        return "What constraint most influenced your decision, and how did it change your approach?"
+    @staticmethod
+    def _extract_concepts(text: str) -> list[str]:
+        lowered = f" {text.lower()} "
+        return [concept for concept in TRACKED_CONCEPTS if f" {concept} " in lowered]
+
+    @staticmethod
+    def _coerce_int(value: Any) -> int | None:
+        return value if isinstance(value, int) else None
+
+    @staticmethod
+    def _normalize_text(value: Any) -> str:
+        return " ".join(str(value or "").strip().split())
+
+    def _clean_question(self, raw_text: str) -> str:
+        cleaned = self._normalize_text(raw_text)
+        cleaned = cleaned.replace(".?", "?")
+        if cleaned and not cleaned.endswith("?"):
+            cleaned = f"{cleaned.rstrip('.')}?"
+        return cleaned.replace(" ?", "?")
+
+    def _anchored_followup_fallback(self, concept: str) -> str:
+        if concept == "async":
+            return "You mentioned async work in your answer. How did you decide the right concurrency limits in that system?"
+        if concept == "api":
+            return "You mentioned APIs in your answer. How did you decide the contract boundaries and error handling strategy?"
+        if concept == "database":
+            return "You mentioned the database in your answer. How did you protect correctness while still meeting performance needs?"
+        if concept == "cache":
+            return "You mentioned caching in your answer. How did you decide what to cache and how to handle stale data risk?"
+        if concept == "auth":
+            return "You mentioned auth in your answer. How did you balance security requirements with developer and user experience?"
+        if concept == "scaling":
+            return "You mentioned scaling in your answer. What bottleneck became the hardest to manage as load increased?"
+        return FALLBACK_QUESTION
