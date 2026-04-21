@@ -3,6 +3,7 @@ from __future__ import annotations
 from contextlib import asynccontextmanager
 
 from fastapi import Depends, FastAPI, HTTPException, Request, WebSocket
+from fastapi.middleware.cors import CORSMiddleware
 
 from database import AsyncSessionFactory, close_database, init_database
 from fsm.engine import SessionEngine
@@ -35,7 +36,7 @@ async def lifespan(app: FastAPI):
         session_factory=AsyncSessionFactory,
         websocket_hub=WebSocketHub(),
         question_service=QuestionService(ai_client=ai_client),
-        evaluation_service=EvaluationService(ai_client=ai_client),
+        evaluation_service=EvaluationService(),
     )
 
     yield
@@ -48,6 +49,14 @@ app = FastAPI(
     title="AI Interview Avatar - Module 1",
     version="2.0.0",
     lifespan=lifespan,
+)
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
 )
 
 
