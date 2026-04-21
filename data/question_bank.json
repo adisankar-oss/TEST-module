@@ -1,0 +1,90 @@
+{
+  "default": {
+    "background": [
+      "Tell me about yourself and the type of work you have focused on recently.",
+      "What kind of problems do you most enjoy working on, and why?"
+    ],
+    "behavioural": [
+      "Describe a challenging situation at work and how you handled it.",
+      "Tell me about a time you had to make progress despite incomplete information."
+    ],
+    "technical_skills": [
+      "What skill has been most important in your recent work, and how have you improved it?",
+      "Walk me through a technical decision you made recently and what tradeoffs you considered."
+    ],
+    "problem_solving": [
+      "Describe how you approach a problem when the root cause is not obvious.",
+      "Tell me about a time you had to debug a difficult issue under time pressure."
+    ],
+    "culture_fit": [
+      "What kind of team environment helps you do your best work?",
+      "How do you build trust when joining a new team or project?"
+    ],
+    "wrapup": [
+      "What is one area you are actively trying to improve in your work right now?",
+      "What would you want your next manager or team to understand about how you work best?"
+    ]
+  },
+  "backend": {
+    "background": [
+      "Tell me about your background in backend systems and the services you have worked on recently."
+    ],
+    "behavioural": [
+      "Describe a time you had to coordinate a backend change across teams with competing priorities."
+    ],
+    "technical_skills": [
+      "How do you design a backend service to stay reliable under high concurrent traffic?",
+      "What tradeoffs do you consider when choosing a database consistency model for a critical workflow?"
+    ],
+    "problem_solving": [
+      "You notice a sudden increase in API latency after a deployment. How would you isolate the cause?",
+      "How would you redesign a backend workflow that is failing intermittently under load?"
+    ],
+    "culture_fit": [
+      "How do you handle disagreement during architecture discussions while keeping delivery moving?"
+    ],
+    "wrapup": [
+      "What kind of engineering culture helps you produce your best backend work?"
+    ]
+  },
+  "frontend": {
+    "background": [
+      "Tell me about the frontend products or interfaces you have been working on recently."
+    ],
+    "behavioural": [
+      "Describe a time you had to balance product pressure with frontend quality or accessibility."
+    ],
+    "technical_skills": [
+      "How do you structure state management in a complex frontend application without overcomplicating it?"
+    ],
+    "problem_solving": [
+      "A production UI becomes slow after a new release. How would you investigate the regression?"
+    ],
+    "culture_fit": [
+      "How do you collaborate with design and backend teams when requirements are still evolving?"
+    ],
+    "wrapup": [
+      "What kind of feedback loop helps you improve fastest as a frontend engineer?"
+    ]
+  },
+  "data": {
+    "background": [
+      "Tell me about the kinds of data systems or analytical workflows you have worked on recently."
+    ],
+    "behavioural": [
+      "Describe a time you had to challenge a decision because the underlying data was unreliable."
+    ],
+    "technical_skills": [
+      "How do you design a data pipeline to handle delayed or malformed events safely?"
+    ],
+    "problem_solving": [
+      "A key metric drops unexpectedly after a pipeline change. How would you determine what happened?"
+    ],
+    "culture_fit": [
+      "How do you work with non-technical stakeholders when data findings are ambiguous?"
+    ],
+    "wrapup": [
+      "What kind of team environment helps you do your best work with data systems?"
+    ]
+  }
+}

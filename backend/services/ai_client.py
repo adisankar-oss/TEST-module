@@ -12,8 +12,8 @@ from utils.logger import get_logger
 
 
 GROQ_API_URL = "https://api.groq.com/openai/v1/chat/completions"
-DEFAULT_MODEL = "llama-3.1-8b-instant"
-FALLBACK_MODEL = "mixtral-8x7b-32768"
+DEFAULT_MODEL = "openai/gpt-oss-120b"
+FALLBACK_MODEL = "llama-3.3-70b-versatile"
 DEFAULT_TIMEOUT_SECONDS = 10
 DEFAULT_MAX_RETRIES = 3
 DEFAULT_TEMPERATURE = 0.4

@@ -1,22 +1,29 @@
-"""Session Engine - Orchestrates the interview FSM and manages session lifecycle."""
 
 from __future__ import annotations
 
 import asyncio
 import json
-import uuid
+from collections import deque
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from typing import TYPE_CHECKING, Any
+from typing import Any
+from uuid import uuid4
 
-from fastapi import WebSocket, WebSocketDisconnect
+from fastapi import HTTPException, WebSocket, WebSocketDisconnect
 from sqlalchemy import select
-from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
-from database import AsyncSessionFactory
-from fsm.transitions import TERMINAL_STATES, RecruiterCommand, SessionState, can_transition
-from fsm.websocket_hub import WebSocketHub
+from fsm.decision import (
+    CONFIG_KEY_FOLLOWUP_SCORE_MAX,
+    CONFIG_KEY_MAX_QUESTIONS,
+    CONFIG_KEY_NEXT_SCORE_MIN,
+    Decision,
+    decide_next_action,
+)
+from fsm.transitions import RecruiterCommand, SessionState, TERMINAL_STATES, validate_transition
 from models import InterviewSession, SessionEvent
 from schemas import (
+    LiveEventEnvelope,
     SessionAnswerResponse,
     SessionCommandResponse,
     SessionCreateRequest,
@@ -24,26 +31,247 @@ from schemas import (
     SessionEventResponse,
     SessionStatusResponse,
 )
-from services.evaluation_service import EvaluationService
+from services.evaluation_service import EvaluationResult, EvaluationService
 from services.question_service import QuestionService
-from services.session_context_service import SessionContextService
 from utils.logger import get_logger
 
-if TYPE_CHECKING:
-    from sqlalchemy.orm import AsyncSession as AsyncSessionType
 
-logger = get_logger("fsm.session_engine")
+def utc_now() -> datetime:
+    return datetime.now(timezone.utc)
 
-# Type alias for session factory
-AsyncSessionFactoryType = type(AsyncSessionFactory)
+
+@dataclass
+class SessionRuntime:
+    session_id: str
+    queue: asyncio.Queue[str] = field(default_factory=asyncio.Queue)
+    paused: bool = False
+    force_wrap: bool = False
+    skip_question: bool = False
+    forced_followup_used: bool = False
+    pending_question: str | None = None
+    pending_topic: str | None = None
+    next_difficulty: str = "normal"
+    interaction_history: deque[dict[str, Any]] = field(default_factory=lambda: deque(maxlen=3))
+    listening_active: bool = False
+    _pending_events: deque[str] = field(default_factory=deque)
+    _scheduled_handles: set[asyncio.Handle] = field(default_factory=set)
+    _command_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
+    _candidate_answer: str | None = None
+    _answer_future: asyncio.Future[SessionAnswerResponse] | None = None
+
+    CONTROL_EVENTS = {
+        "pause",
+        "resume",
+        "candidate_left",
+        "candidate_rejoined",
+        "skip_question",
+        "end_interview",
+        "candidate_answer",
+    }
+
+    def emit(self, event: str) -> None:
+        self.queue.put_nowait(event)
+
+    async def pause(self) -> None:
+        async with self._command_lock:
+            if self.paused:
+                raise HTTPException(status_code=409, detail="Session is already paused")
+            self.paused = True
+            self.emit("pause")
+
+    async def resume(self) -> None:
+        async with self._command_lock:
+            if not self.paused:
+                raise HTTPException(status_code=409, detail="Session is not paused")
+            self.paused = False
+            self.emit("resume")
+
+    async def skip_current_question(self) -> None:
+        async with self._command_lock:
+            self.skip_question = True
+            self.emit("skip_question")
+
+    async def end_interview(self) -> None:
+        async with self._command_lock:
+            self.force_wrap = True
+            self.emit("end_interview")
+
+    async def mark_candidate_left(self) -> None:
+        async with self._command_lock:
+            self.paused = True
+            self.emit("candidate_left")
+
+    async def mark_candidate_rejoined(self) -> None:
+        async with self._command_lock:
+            if not self.paused:
+                raise HTTPException(status_code=409, detail="Session is not paused")
+            self.paused = False
+            self.emit("candidate_rejoined")
+
+    async def mark_listening(self) -> None:
+        async with self._command_lock:
+            self.listening_active = True
+
+    async def submit_answer(self, answer: str) -> asyncio.Future[SessionAnswerResponse]:
+        async with self._command_lock:
+            if self.paused:
+                raise HTTPException(status_code=409, detail="Session is paused")
+            if not self.listening_active:
+                raise HTTPException(status_code=409, detail="Session is not waiting for an answer")
+            if self._candidate_answer is not None:
+                raise HTTPException(status_code=409, detail="An answer is already being processed")
+
+            loop = asyncio.get_running_loop()
+            self._candidate_answer = answer
+            self._answer_future = loop.create_future()
+            self.emit("candidate_answer")
+            return self._answer_future
+
+    async def consume_answer_submission(
+        self,
+    ) -> tuple[str | None, asyncio.Future[SessionAnswerResponse] | None]:
+        async with self._command_lock:
+            answer = self._candidate_answer
+            future = self._answer_future
+            self._candidate_answer = None
+            self._answer_future = None
+            self.listening_active = False
+            return answer, future
+
+    async def clear_listening(self) -> None:
+        async with self._command_lock:
+            self.listening_active = False
+            self._candidate_answer = None
+            self._answer_future = None
+
+    def resolve_answer_future(
+        self,
+        future: asyncio.Future[SessionAnswerResponse] | None,
+        response: SessionAnswerResponse,
+    ) -> None:
+        if future is not None and not future.done():
+            future.set_result(response)
+
+    def schedule_event(self, event: str, delay: float) -> None:
+        loop = asyncio.get_running_loop()
+
+        def _dispatch() -> None:
+            self._scheduled_handles.discard(handle_ref)
+            self.emit(event)
+
+        handle_ref = loop.call_later(delay, _dispatch)
+        self._scheduled_handles.add(handle_ref)
+
+    def cancel_scheduled(self) -> None:
+        for handle in list(self._scheduled_handles):
+            handle.cancel()
+        self._scheduled_handles.clear()
+
+    async def wait_for_event(self, event: str, timeout: int) -> str:
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + timeout
+
+        while True:
+            next_event = self._pop_relevant_pending_event(event)
+            if next_event is None:
+                remaining = deadline - loop.time()
+                if remaining <= 0:
+                    raise TimeoutError(f"Timed out while waiting for event '{event}'")
+                next_event = await asyncio.wait_for(self.queue.get(), timeout=remaining)
+
+            if next_event in {"pause", "candidate_left"}:
+                async with self._command_lock:
+                    self.paused = True
+                continue
+
+            if next_event in {"resume", "candidate_rejoined"}:
+                async with self._command_lock:
+                    self.paused = False
+                continue
+
+            if next_event == "end_interview":
+                async with self._command_lock:
+                    self.force_wrap = True
+                if event == "candidate_answer":
+                    return "end_interview"
+                continue
+
+            if next_event == "skip_question":
+                async with self._command_lock:
+                    self.skip_question = True
+                if event == "candidate_answer":
+                    return "skip_question"
+                continue
+
+            if self.paused:
+                self._pending_events.append(next_event)
+                continue
+
+            if next_event == event:
+                return next_event
+
+            self._pending_events.append(next_event)
+
+    def _pop_relevant_pending_event(self, target: str) -> str | None:
+        wanted = self.CONTROL_EVENTS | {target}
+        for index, event in enumerate(self._pending_events):
+            if event in wanted:
+                del self._pending_events[index]
+                return event
+        return None
+
+
+class WebSocketHub:
+    def __init__(self) -> None:
+        self._connections: dict[str, set[WebSocket]] = {}
+        self._lock = asyncio.Lock()
+
+    async def connect(self, session_id: str, websocket: WebSocket) -> None:
+        await websocket.accept()
+        async with self._lock:
+            self._connections.setdefault(session_id, set()).add(websocket)
+
+    async def disconnect(self, session_id: str, websocket: WebSocket) -> None:
+        async with self._lock:
+            sockets = self._connections.get(session_id)
+            if not sockets:
+                return
+            sockets.discard(websocket)
+            if not sockets:
+                self._connections.pop(session_id, None)
+
+    async def broadcast(self, session_id: str, envelope: LiveEventEnvelope) -> None:
+        async with self._lock:
+            sockets = list(self._connections.get(session_id, set()))
+
+        payload = envelope.model_dump()
+        dead_connections: list[WebSocket] = []
+        for websocket in sockets:
+            try:
+                await websocket.send_json(payload)
+            except Exception:
+                dead_connections.append(websocket)
+
+        for websocket in dead_connections:
+            await self.disconnect(session_id, websocket)
+
+    async def close_all(self) -> None:
+        async with self._lock:
+            sessions = list(self._connections.items())
+            self._connections.clear()
+
+        for _, websockets in sessions:
+            for websocket in websockets:
+                try:
+                    await websocket.close()
+                except Exception:
+                    pass
 
 
 class SessionEngine:
-    """Orchestrates interview sessions using an async finite state machine."""
-
     def __init__(
         self,
-        session_factory: AsyncSessionFactoryType,
+        session_factory: async_sessionmaker[AsyncSession],
         websocket_hub: WebSocketHub,
         question_service: QuestionService,
         evaluation_service: EvaluationService,
@@ -52,929 +280,812 @@ class SessionEngine:
         self._websocket_hub = websocket_hub
         self._question_service = question_service
         self._evaluation_service = evaluation_service
-        self._logger = get_logger("fsm.session_engine")
+        self._logger = get_logger("fsm.engine")
+        self._tasks: dict[str, asyncio.Task[None]] = {}
+        self._runtimes: dict[str, SessionRuntime] = {}
+        self._task_lock = asyncio.Lock()
 
-        # In-memory tracking for active sessions
-        # session_id -> {"fsm_task": asyncio.Task, "context": SessionContextService}
-        self._active_sessions: dict[str, dict[str, Any]] = {}
-        # session_id -> asyncio.Event for signaling pending answer
-        self._answer_events: dict[str, asyncio.Event] = {}
-        # session_id -> submitted answer text
-        self._pending_answers: dict[str, str] = {}
-
-    async def create_session(
-        self, payload: SessionCreateRequest
-    ) -> SessionCreateResponse:
-        """Create a new interview session and start FSM loop."""
-        session_id = str(uuid.uuid4())
-
-        try:
-            async with self._session_factory() as session:
-                # Create InterviewSession record
-                interview_session = InterviewSession(
-                    id=session_id,
-                    candidate_id=payload.candidate_id,
-                    job_id=payload.job_id,
-                    meeting_url=payload.meeting_url,
-                    meeting_type=payload.meeting_type,
-                    schedule_time=payload.schedule_time,
-                    state=SessionState.WAITING.value,
-                    status=SessionState.WAITING.value,
-                    config=payload.config.model_dump(),
-                    topics=payload.config.topics,
-                    language=payload.config.language,
-                    avatar_persona=payload.config.avatar_persona,
-                    force_followup_test=payload.config.force_followup_test,
-                    is_running=True,
-                )
-                session.add(interview_session)
-                await session.commit()
-
-            self._logger.info(
-                json.dumps(
-                    {
-                        "event": "session_created",
-                        "session_id": session_id,
-                        "candidate_id": payload.candidate_id,
-                        "job_id": payload.job_id,
-                    }
-                )
-            )
-
-            # Initialize context and start FSM loop in background
-            context_service = SessionContextService()
-            fsm_task = asyncio.create_task(
-                self._run_fsm_loop(session_id, payload)
-            )
-            self._active_sessions[session_id] = {
-                "fsm_task": fsm_task,
-                "context": context_service,
-            }
-            self._answer_events[session_id] = asyncio.Event()
-
-            return SessionCreateResponse(
-                session_id=session_id,
+    async def create_session(self, payload: SessionCreateRequest) -> SessionCreateResponse:
+        session_id = str(uuid4())
+        async with self._session_factory() as db:
+            record = InterviewSession(
+                id=session_id,
+                candidate_id=payload.candidate_id,
+                job_id=payload.job_id,
+                meeting_url=payload.meeting_url,
+                meeting_type=payload.meeting_type,
+                schedule_time=payload.schedule_time,
+                state=SessionState.WAITING.value,
                 status=SessionState.WAITING.value,
-                join_url=payload.meeting_url,
+                current_question_number=0,
+                current_question_text=None,
+                greeting_text=None,
+                duration_seconds=0,
+                max_duration_minutes=payload.config.max_duration_minutes,
+                max_questions=payload.config.max_questions,
+                config=payload.config.model_dump(),
+                topics=payload.config.topics,
+                language=payload.config.language,
+                avatar_persona=payload.config.avatar_persona,
+                force_followup_test=payload.config.force_followup_test,
+                is_running=False,
             )
+            db.add(record)
+            await db.commit()
 
-        except Exception as exc:
-            self._logger.error(
-                json.dumps(
-                    {
-                        "event": "session_creation_failed",
-                        "error": str(exc),
-                        "candidate_id": payload.candidate_id,
-                    }
-                )
-            )
-            raise
+        await self._start_session_task(session_id)
+        return SessionCreateResponse(
+            session_id=session_id,
+            status="SCHEDULED",
+            join_url=payload.meeting_url,
+        )
 
     async def list_sessions(self) -> list[SessionStatusResponse]:
-        """List all sessions."""
-        try:
-            async with self._session_factory() as session:
-                result = await session.execute(select(InterviewSession))
-                sessions = result.scalars().all()
-                return [
-                    SessionStatusResponse(
-                        session_id=s.id,
-                        state=s.state,
-                        current_question_number=s.current_question_number,
-                        duration_seconds=s.duration_seconds,
-                        max_questions=s.max_questions,
-                        max_duration_minutes=s.max_duration_minutes,
-                        ended_reason=s.ended_reason,
-                    )
-                    for s in sessions
-                ]
-        except Exception as exc:
-            self._logger.error(
-                json.dumps({"event": "session_list_failed", "error": str(exc)})
+        async with self._session_factory() as db:
+            result = await db.execute(
+                select(InterviewSession).order_by(InterviewSession.created_at.desc())
             )
-            raise
+            sessions = result.scalars().all()
+        return [self._to_status_response(session) for session in sessions]
 
     async def get_status(self, session_id: str) -> SessionStatusResponse:
-        """Get session status."""
-        try:
-            async with self._session_factory() as session:
-                result = await session.execute(
-                    select(InterviewSession).where(InterviewSession.id == session_id)
-                )
-                interview_session = result.scalar_one_or_none()
-                if not interview_session:
-                    raise ValueError(f"Session {session_id} not found")
+        session = await self._get_session(session_id)
+        return self._to_status_response(session)
 
-                return SessionStatusResponse(
-                    session_id=interview_session.id,
-                    state=interview_session.state,
-                    current_question_number=interview_session.current_question_number,
-                    duration_seconds=interview_session.duration_seconds,
-                    max_questions=interview_session.max_questions,
-                    max_duration_minutes=interview_session.max_duration_minutes,
-                    ended_reason=interview_session.ended_reason,
-                )
-        except Exception as exc:
-            self._logger.error(
-                json.dumps(
-                    {
-                        "event": "session_status_failed",
-                        "session_id": session_id,
-                        "error": str(exc),
-                    }
-                )
-            )
-            raise
+    async def submit_answer(self, session_id: str, answer: str) -> SessionAnswerResponse:
+        runtime = self._runtime_for(session_id)
+        async with self._session_factory() as db:
+            session = await self._get_session_for_update(db, session_id)
+            self._ensure_not_terminal(session)
+            if SessionState(session.status) != SessionState.LISTENING:
+                raise HTTPException(status_code=409, detail="Answers are only accepted in LISTENING state")
+            if not session.current_question_text:
+                raise HTTPException(status_code=409, detail="No active question to answer")
+            await db.commit()
+
+        await runtime.mark_listening()
+        future = await runtime.submit_answer(answer)
+        try:
+            return await asyncio.wait_for(future, timeout=45)
+        except TimeoutError as exc:
+            raise HTTPException(status_code=504, detail="Timed out waiting for evaluation") from exc
 
     async def apply_command(
-        self, session_id: str, command: RecruiterCommand
+        self,
+        session_id: str,
+        command: RecruiterCommand,
     ) -> SessionCommandResponse:
-        """Apply a recruiter command to a session."""
-        try:
-            async with self._session_factory() as session:
-                result = await session.execute(
-                    select(InterviewSession).where(InterviewSession.id == session_id)
-                )
-                interview_session = result.scalar_one_or_none()
-                if not interview_session:
-                    raise ValueError(f"Session {session_id} not found")
+        runtime = self._runtime_for(session_id)
+        async with self._session_factory() as db:
+            session = await self._get_session_for_update(db, session_id)
+            self._ensure_not_terminal(session)
+            self._validate_command(command, session)
 
-                # TODO: Implement command handling (pause, resume, skip, etc.)
-                # For now, just return current state
-                self._logger.info(
-                    json.dumps(
-                        {
-                            "event": "command_received",
-                            "session_id": session_id,
-                            "command": command.value,
-                            "state": interview_session.state,
-                        }
-                    )
-                )
-
-                return SessionCommandResponse(
-                    session_id=session_id,
-                    command=command.value,
-                    state=interview_session.state,
-                    max_duration_minutes=interview_session.max_duration_minutes,
-                )
-
-        except Exception as exc:
-            self._logger.error(
-                json.dumps(
+            if command == RecruiterCommand.EXTEND_5MIN:
+                session.max_duration_minutes += 5
+                session.config["max_duration_minutes"] = session.max_duration_minutes
+                await self._append_event(
+                    db,
+                    session_id,
+                    "state_changed",
                     {
-                        "event": "command_failed",
-                        "session_id": session_id,
                         "command": command.value,
-                        "error": str(exc),
-                    }
+                        "status": session.status,
+                        "max_duration_minutes": session.max_duration_minutes,
+                    },
                 )
-            )
-            raise
+                await db.commit()
+                current_status = session.status
+                max_duration_minutes = session.max_duration_minutes
+            else:
+                current_status = session.status
+                max_duration_minutes = session.max_duration_minutes
+                await db.commit()
 
-    async def submit_answer(
-        self, session_id: str, answer: str
-    ) -> SessionAnswerResponse:
-        """Submit candidate answer. Only valid in LISTENING state.
-        
-        This endpoint:
-        1. Validates session is in LISTENING state
-        2. Stores the answer
-        3. Signals the FSM to resume (move to EVALUATING)
-        4. Waits for evaluation
-        5. Returns score, feedback, and next state
-        """
-        try:
-            async with self._session_factory() as session:
-                result = await session.execute(
-                    select(InterviewSession).where(InterviewSession.id == session_id)
-                )
-                interview_session = result.scalar_one_or_none()
-                if not interview_session:
-                    raise ValueError(f"Session {session_id} not found")
+        if command == RecruiterCommand.PAUSE:
+            await runtime.pause()
+        elif command == RecruiterCommand.RESUME:
+            await runtime.resume()
+        elif command == RecruiterCommand.SKIP_QUESTION:
+            await runtime.skip_current_question()
+        elif command == RecruiterCommand.END_INTERVIEW:
+            await runtime.end_interview()
 
-                # Only accept answers in LISTENING state
-                if interview_session.state != SessionState.LISTENING.value:
-                    raise ValueError(
-                        f"Cannot submit answer in state {interview_session.state}. "
-                        f"Session must be in LISTENING state."
-                    )
-
-                # Store the answer and signal FSM to resume
-                self._pending_answers[session_id] = answer
-                event = self._answer_events.get(session_id)
-                if event:
-                    event.set()
-
-                # Log answer received
-                self._logger.info(
-                    json.dumps(
-                        {
-                            "event": "answer_received",
-                            "session_id": session_id,
-                            "question_number": interview_session.current_question_number,
-                            "answer_length": len(answer),
-                        }
-                    )
-                )
-
-                # Wait a bit for evaluation to complete
-                await asyncio.sleep(1)
-
-                # Re-fetch to get updated state and evaluation
-                await session.refresh(interview_session)
-
-                # Get context for response
-                context_service = self._active_sessions.get(session_id, {}).get(
-                    "context"
-                )
-                history = context_service.get_history() if context_service else []
-                last_item = history[-1] if history else None
-
-                return SessionAnswerResponse(
-                    question=interview_session.current_question_text or "",
-                    answer=answer,
-                    score=last_item["score"] if last_item else 5,
-                    feedback=last_item["feedback"] if last_item else "Evaluating...",
-                    next_state=interview_session.state,
-                )
-
-        except Exception as exc:
-            self._logger.error(
-                json.dumps(
-                    {
-                        "event": "answer_submission_failed",
-                        "session_id": session_id,
-                        "error": str(exc),
-                    }
-                )
-            )
-            raise
-
-    async def handle_candidate_disconnected(
-        self, session_id: str
-    ) -> SessionEventResponse:
-        """Handle candidate disconnection."""
-        self._logger.info(
-            json.dumps(
-                {
-                    "event": "candidate_disconnected",
-                    "session_id": session_id,
-                }
-            )
-        )
-        # TODO: Implement reconnection window
-        return SessionEventResponse(
+        return SessionCommandResponse(
             session_id=session_id,
-            status="candidate_disconnected",
+            command=command.value,
+            state=current_status,
+            max_duration_minutes=max_duration_minutes if command == RecruiterCommand.EXTEND_5MIN else None,
         )
 
-    async def handle_candidate_reconnected(
-        self, session_id: str
-    ) -> SessionEventResponse:
-        """Handle candidate reconnection."""
-        self._logger.info(
-            json.dumps(
-                {
-                    "event": "candidate_reconnected",
-                    "session_id": session_id,
-                }
-            )
-        )
-        return SessionEventResponse(
-            session_id=session_id,
-            status="candidate_reconnected",
-        )
+    async def handle_candidate_disconnected(self, session_id: str) -> SessionEventResponse:
+        runtime = self._runtime_for(session_id)
+        async with self._session_factory() as db:
+            session = await self._get_session_for_update(db, session_id)
+            self._ensure_not_terminal(session)
+            await db.commit()
+        await runtime.mark_candidate_left()
+        return SessionEventResponse(session_id=session_id, status="paused_waiting_reconnect")
 
-    async def handle_live_connection(
-        self, websocket: WebSocket, session_id: str
-    ) -> None:
-        """Handle WebSocket connection for live session updates."""
+    async def handle_candidate_reconnected(self, session_id: str) -> SessionEventResponse:
+        runtime = self._runtime_for(session_id)
+        async with self._session_factory() as db:
+            session = await self._get_session_for_update(db, session_id)
+            self._ensure_not_terminal(session)
+            await db.commit()
+        await runtime.mark_candidate_rejoined()
+        return SessionEventResponse(session_id=session_id, status="resumed")
+
+    async def handle_live_connection(self, websocket: WebSocket, session_id: str) -> None:
         await self._websocket_hub.connect(session_id, websocket)
         try:
+            snapshot = await self.get_status(session_id)
+            await websocket.send_json(
+                LiveEventEnvelope(
+                    event="session_snapshot",
+                    payload=snapshot.model_dump(mode="json"),
+                ).model_dump()
+            )
             while True:
-                # Keep connection alive and listen for any incoming messages
                 await websocket.receive_text()
         except WebSocketDisconnect:
             await self._websocket_hub.disconnect(session_id, websocket)
-        except Exception as exc:
-            self._logger.error(
-                json.dumps(
-                    {
-                        "event": "websocket_error",
-                        "session_id": session_id,
-                        "error": str(exc),
-                    }
-                )
-            )
+        except Exception:
             await self._websocket_hub.disconnect(session_id, websocket)
 
     async def shutdown(self) -> None:
-        """Gracefully shut down all active sessions."""
-        self._logger.info(
-            json.dumps(
-                {
-                    "event": "session_engine_shutdown",
-                    "active_sessions": len(self._active_sessions),
-                }
-            )
-        )
-        for session_id, session_info in list(self._active_sessions.items()):
-            fsm_task = session_info.get("fsm_task")
-            if fsm_task:
-                fsm_task.cancel()
+        async with self._task_lock:
+            tasks = list(self._tasks.values())
+        for task in tasks:
+            task.cancel()
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+        for runtime in self._runtimes.values():
+            runtime.cancel_scheduled()
+        await self._websocket_hub.close_all()
 
-    # ===== Private FSM Loop =====
+    async def _start_session_task(self, session_id: str) -> None:
+        async with self._task_lock:
+            existing = self._tasks.get(session_id)
+            if existing and not existing.done():
+                return
+            task = asyncio.create_task(self._run_session(session_id), name=f"fsm:{session_id}")
+            self._tasks[session_id] = task
+            task.add_done_callback(lambda done, sid=session_id: self._on_task_done(sid, done))
 
-    async def _run_fsm_loop(
-        self, session_id: str, payload: SessionCreateRequest
-    ) -> None:
-        """Main FSM loop - orchestrates state transitions and actions."""
+    def _on_task_done(self, session_id: str, task: asyncio.Task[None]) -> None:
+        self._tasks.pop(session_id, None)
+        self._cleanup_runtime(session_id)
         try:
-            # Wait for FSM start delay
-            await asyncio.sleep(payload.config.fsm_start_delay_seconds)
+            task.result()
+        except asyncio.CancelledError:
+            pass
+        except Exception as exc:
+            self._logger.exception("Background session task crashed for %s: %s", session_id, exc)
 
-            # Initialize session state
-            current_state = SessionState.WAITING
-            question_number = 0
-            started_at = datetime.now(timezone.utc)
+    async def _run_session(self, session_id: str) -> None:
+        runtime = self._runtime_for(session_id)
+        if not await self._acquire_execution_lock(session_id):
+            return
 
-            while current_state not in TERMINAL_STATES:
-                # Execute state-specific actions
-                try:
-                    current_state = await self._execute_state(
-                        session_id,
-                        current_state,
-                        payload,
-                        question_number,
-                    )
-                    question_number += 1
-
-                except Exception as exc:
-                    self._logger.error(
-                        json.dumps(
-                            {
-                                "event": "state_execution_error",
-                                "session_id": session_id,
-                                "state": current_state.value,
-                                "error": str(exc),
-                            }
-                        )
-                    )
-                    current_state = SessionState.ERROR
-
-            # Session ended or errored
-            ended_at = datetime.now(timezone.utc)
-            duration_seconds = int((ended_at - started_at).total_seconds())
-
-            await self._finalize_session(
-                session_id, current_state, duration_seconds
+        try:
+            start_config = self._session_config(await self._get_session(session_id))
+            runtime.schedule_event("fsm_start", start_config["fsm_start_delay_seconds"])
+            await runtime.wait_for_event(
+                "fsm_start",
+                timeout=max(start_config["fsm_start_delay_seconds"] + 5, 5),
             )
 
-        except Exception as exc:
-            self._logger.error(
-                json.dumps(
+            await self._mark_started(session_id)
+            await self._transition_state(session_id, SessionState.INTRO, "session_started")
+
+            intro_session = await self._get_session(session_id)
+            greeting = await self._question_service.generate_greeting(
+                candidate_id=intro_session.candidate_id,
+                job_id=intro_session.job_id,
+                context=list(runtime.interaction_history),
+            )
+            await self._store_greeting(session_id, greeting)
+            await self._publish_event(session_id, "greeting_generated", {"greeting": greeting})
+
+            intro_config = self._session_config(intro_session)
+            runtime.schedule_event("intro_complete", intro_config["intro_delay_seconds"])
+            await runtime.wait_for_event(
+                "intro_complete",
+                timeout=intro_config["intro_timeout_seconds"],
+            )
+
+            await self._transition_state(session_id, SessionState.ASKING, "intro_complete")
+            question_number = 1
+
+            while True:
+                snapshot = await self._get_session(session_id)
+                if SessionState(snapshot.status) in TERMINAL_STATES:
+                    break
+
+                config = self._session_config(snapshot)
+                await self._set_question_number(session_id, question_number)
+                snapshot.current_question_number = question_number
+
+                if runtime.pending_question is not None:
+                    question = runtime.pending_question
+                    runtime.pending_question = None
+                    runtime.pending_topic = None
+                    snapshot.config = dict(snapshot.config or {})
+                    snapshot.config.setdefault("question_history", []).append(
+                        {
+                            "question": question,
+                            "topic": "followup",
+                            "type": "followup",
+                            "reasoning": "followup",
+                            "expected_keywords": [],
+                            "follow_up_hint": "",
+                        }
+                    )
+                else:
+                    question = await self._question_service.generate_question(snapshot)
+
+                await self._store_active_question(session_id, question, snapshot.config)
+                await self._publish_event(
+                    session_id,
+                    "question_asked",
                     {
-                        "event": "fsm_loop_failed",
-                        "session_id": session_id,
-                        "error": str(exc),
+                        "question_number": question_number,
+                        "question": question,
+                    },
+                )
+
+                runtime.schedule_event("question_delivered", config["question_delivery_delay_seconds"])
+                await runtime.wait_for_event(
+                    "question_delivered",
+                    timeout=config["question_delivery_timeout_seconds"],
+                )
+                await self._transition_state(session_id, SessionState.LISTENING, "question_delivered")
+
+                await runtime.mark_listening()
+                try:
+                    answer_event = await runtime.wait_for_event(
+                        "candidate_answer",
+                        timeout=self._listening_timeout_seconds(snapshot, config),
+                    )
+                except TimeoutError:
+                    await runtime.clear_listening()
+                    answer_event = "end_interview"
+
+                answer, answer_future = await runtime.consume_answer_submission()
+                if answer_event == "skip_question":
+                    answer = "Question skipped by recruiter."
+                    await self._publish_answer_received(session_id, question, answer, skipped=True)
+                    await self._transition_state(session_id, SessionState.EVALUATING, "skip_question")
+                    evaluation = EvaluationResult(
+                        score=5,
+                        feedback="The question was skipped before the candidate answered.",
+                    )
+                elif answer_event == "end_interview":
+                    answer = answer or ""
+                    await self._transition_state(session_id, SessionState.EVALUATING, "end_interview")
+                    evaluation = EvaluationResult(
+                        score=5,
+                        feedback="The interview ended before an answer was provided.",
+                    )
+                else:
+                    if not answer:
+                        raise RuntimeError("Candidate answer event received without answer payload")
+                    await self._publish_answer_received(session_id, question, answer, skipped=False)
+                    await self._transition_state(session_id, SessionState.EVALUATING, "answer_received")
+                    evaluation = await self._evaluate_answer(
+                        snapshot,
+                        runtime,
+                        question=question,
+                        answer=answer,
+                    )
+
+                await self._publish_event(
+                    session_id,
+                    "evaluation_completed",
+                    {
+                        "question_number": question_number,
+                        "score": evaluation.score,
+                        "feedback": evaluation.feedback,
+                        "overall_score": evaluation.overall_score,
+                        "red_flags": evaluation.red_flags,
+                        "needs_followup": evaluation.needs_followup,
+                        "followup_reason": evaluation.followup_reason,
+                    },
+                )
+                await self._publish_event(
+                    session_id,
+                    "score_ready",
+                    {
+                        "question_number": question_number,
+                        "score": evaluation.score,
+                        "feedback": evaluation.feedback,
+                        "overall_score": evaluation.overall_score,
+                        "red_flags": evaluation.red_flags,
+                        "needs_followup": evaluation.needs_followup,
+                        "followup_reason": evaluation.followup_reason,
+                    },
+                )
+
+                await self._record_answer_outcome(
+                    session_id=session_id,
+                    answer=answer or "",
+                    score=evaluation.score,
+                    feedback=evaluation.feedback,
+                    overall_score=evaluation.overall_score,
+                    red_flags=evaluation.red_flags,
+                    needs_followup=evaluation.needs_followup,
+                    followup_reason=evaluation.followup_reason,
+                    clear_current_question=True,
+                )
+                await self._transition_state(session_id, SessionState.DECISION, "score_ready")
+
+                runtime.interaction_history.append(
+                    {
+                        "question_number": question_number,
+                        "question": question,
+                        "answer": answer or "",
+                        "score": evaluation.score,
+                        "feedback": evaluation.feedback,
+                        "overall_score": evaluation.overall_score,
+                        "red_flags": evaluation.red_flags,
+                        "needs_followup": evaluation.needs_followup,
+                        "followup_reason": evaluation.followup_reason,
                     }
                 )
-            )
-            await self._finalize_session(
-                session_id, SessionState.ERROR, 0, f"FSM loop error: {str(exc)}"
-            )
-        finally:
-            # Cleanup
-            if session_id in self._active_sessions:
-                del self._active_sessions[session_id]
-            if session_id in self._answer_events:
-                del self._answer_events[session_id]
-            if session_id in self._pending_answers:
-                del self._pending_answers[session_id]
 
-    async def _execute_state(
+                decision = self._resolve_decision(
+                    score=evaluation.score,
+                    question_number=question_number,
+                    config=config,
+                    runtime=runtime,
+                    session_started_at=snapshot.started_at,
+                )
+                self._logger.info(
+                    json.dumps(
+                        {
+                            "event": "decision_made",
+                            "session_id": session_id,
+                            "question_number": question_number,
+                            "score": evaluation.score,
+                            "overall_score": evaluation.overall_score,
+                            "red_flags": evaluation.red_flags,
+                            "needs_followup": evaluation.needs_followup,
+                            "followup_reason": evaluation.followup_reason,
+                            "decision": decision,
+                            "timestamp": utc_now().isoformat(),
+                        }
+                    )
+                )
+
+                next_state = "ASKING" if decision in {
+                    Decision.FOLLOWUP.value,
+                    Decision.NEXT.value,
+                    Decision.HARDER.value,
+                } else "WRAPPING"
+                runtime.resolve_answer_future(
+                    answer_future,
+                    SessionAnswerResponse(
+                        question=question,
+                        answer=answer or "",
+                        score=evaluation.score,
+                        feedback=evaluation.feedback,
+                        next_state=next_state,
+                    ),
+                )
+
+                if decision == Decision.FOLLOWUP.value:
+                    await self._transition_state(session_id, SessionState.FOLLOWUP, "low_score")
+                    runtime.pending_question = await self._question_service.generate_followup(
+                        original_question=question,
+                        candidate_answer=answer or "",
+                        evaluation_feedback=evaluation.feedback,
+                        context=list(runtime.interaction_history),
+                    )
+                    runtime.next_difficulty = "normal"
+                    await self._transition_state(session_id, SessionState.ASKING, "followup_generated")
+                    continue
+
+                if decision == Decision.HARDER.value:
+                    question_number += 1
+                    runtime.next_difficulty = "hard"
+                    await self._transition_state(session_id, SessionState.ASKING, "harder_question")
+                    continue
+
+                if decision == Decision.NEXT.value:
+                    question_number += 1
+                    runtime.next_difficulty = "normal"
+                    await self._transition_state(session_id, SessionState.ASKING, "next_question")
+                    continue
+
+                runtime.next_difficulty = "normal"
+                await self._transition_state(session_id, SessionState.WRAPPING, "decision_wrap")
+                break
+
+            await self._clear_active_question(session_id)
+            await self._transition_state(session_id, SessionState.ENDED, "interview_completed")
+            await self._finalize_completion(session_id)
+        except Exception as exc:
+            await runtime.clear_listening()
+            await self._handle_failure(session_id, exc)
+        finally:
+            runtime.cancel_scheduled()
+            await self._release_execution_lock(session_id)
+
+    async def _acquire_execution_lock(self, session_id: str) -> bool:
+        async with self._session_factory() as db:
+            session = await self._get_session_for_update(db, session_id)
+            if session.is_running or SessionState(session.status) in TERMINAL_STATES:
+                await db.commit()
+                return False
+            session.is_running = True
+            await db.commit()
+            return True
+
+    async def _release_execution_lock(self, session_id: str) -> None:
+        async with self._session_factory() as db:
+            session = await self._get_session_for_update(db, session_id)
+            session.is_running = False
+            await db.commit()
+
+    async def _mark_started(self, session_id: str) -> None:
+        async with self._session_factory() as db:
+            session = await self._get_session_for_update(db, session_id)
+            if session.started_at is None:
+                session.started_at = utc_now()
+            session.duration_seconds = 0
+            await db.commit()
+
+    async def _set_question_number(self, session_id: str, question_number: int) -> None:
+        async with self._session_factory() as db:
+            session = await self._get_session_for_update(db, session_id)
+            session.current_question_number = question_number
+            session.duration_seconds = self._current_duration_seconds(session)
+            await db.commit()
+
+    async def _store_greeting(self, session_id: str, greeting: str) -> None:
+        async with self._session_factory() as db:
+            session = await self._get_session_for_update(db, session_id)
+            session.greeting_text = greeting
+            await db.commit()
+
+    async def _store_active_question(
         self,
         session_id: str,
-        current_state: SessionState,
-        payload: SessionCreateRequest,
-        question_number: int,
-    ) -> SessionState:
-        """Execute actions for current state and return next state."""
+        question: str,
+        config: dict[str, Any],
+    ) -> None:
+        async with self._session_factory() as db:
+            session = await self._get_session_for_update(db, session_id)
+            session.current_question_text = question
+            session.config = dict(config or {})
+            session.duration_seconds = self._current_duration_seconds(session)
+            await db.commit()
 
-        if current_state == SessionState.WAITING:
-            return await self._state_waiting(session_id, payload)
+    async def _clear_active_question(self, session_id: str) -> None:
+        async with self._session_factory() as db:
+            session = await self._get_session_for_update(db, session_id)
+            session.current_question_text = None
+            await db.commit()
 
-        elif current_state == SessionState.INTRO:
-            return await self._state_intro(session_id, payload)
+    async def _record_answer_outcome(
+        self,
+        *,
+        session_id: str,
+        answer: str,
+        score: int,
+        feedback: str,
+        overall_score: int | None,
+        red_flags: list[str],
+        needs_followup: bool,
+        followup_reason: str,
+        clear_current_question: bool,
+    ) -> None:
+        async with self._session_factory() as db:
+            session = await self._get_session_for_update(db, session_id)
+            config = dict(session.config or {})
+            history = config.get("question_history", [])
+            if isinstance(history, list) and history:
+                latest = dict(history[-1])
+                latest["answer"] = answer
+                latest["score"] = score
+                latest["feedback"] = feedback
+                latest["overall_score"] = overall_score
+                latest["red_flags"] = list(red_flags)
+                latest["needs_followup"] = needs_followup
+                latest["followup_reason"] = followup_reason
+                history[-1] = latest
+                config["question_history"] = history[-10:]
+                session.config = config
+            if clear_current_question:
+                session.current_question_text = None
+            session.duration_seconds = self._current_duration_seconds(session)
+            await db.commit()
 
-        elif current_state == SessionState.ASKING:
-            return await self._state_asking(session_id, payload, question_number)
+    async def _transition_state(
+        self,
+        session_id: str,
+        target_state: SessionState,
+        reason: str,
+        *,
+        force: bool = False,
+    ) -> None:
+        timestamp = utc_now().isoformat()
+        async with self._session_factory() as db:
+            session = await self._get_session_for_update(db, session_id)
+            current_state = SessionState(session.status)
+            if not force:
+                validate_transition(current_state, target_state)
 
-        elif current_state == SessionState.LISTENING:
-            return await self._state_listening(session_id, payload)
+            session.status = target_state.value
+            session.state = target_state.value
+            session.duration_seconds = self._current_duration_seconds(session)
+            if target_state == SessionState.WRAPPING and session.ended_reason is None:
+                session.ended_reason = "complete"
+            if target_state == SessionState.ENDED:
+                session.ended_at = utc_now()
+                session.ended_reason = session.ended_reason or "complete"
+            if target_state == SessionState.ERROR:
+                session.ended_at = utc_now()
+                session.ended_reason = session.ended_reason or "error"
 
-        elif current_state == SessionState.EVALUATING:
-            return await self._state_evaluating(session_id, payload, question_number)
+            payload = {
+                "from": current_state.value,
+                "to": target_state.value,
+                "reason": reason,
+                "timestamp": timestamp,
+            }
+            await self._append_event(db, session_id, "state_changed", payload)
+            await db.commit()
 
-        elif current_state == SessionState.DECISION:
-            return await self._state_decision(session_id, payload, question_number)
-
-        elif current_state == SessionState.FOLLOWUP:
-            return await self._state_followup(session_id, payload)
-
-        elif current_state == SessionState.WRAPPING:
-            return await self._state_wrapping(session_id, payload)
-
-        else:
-            return SessionState.ERROR
-
-    async def _state_waiting(
-        self, session_id: str, payload: SessionCreateRequest
-    ) -> SessionState:
-        """WAITING state: Prepare for interview."""
         self._logger.info(
             json.dumps(
                 {
                     "event": "state_transition",
                     "session_id": session_id,
-                    "from_state": SessionState.WAITING.value,
-                    "to_state": SessionState.INTRO.value,
+                    "from": current_state.value,
+                    "to": target_state.value,
+                    "reason": reason,
+                    "timestamp": timestamp,
                 }
             )
         )
-
-        await self._update_session_state(
-            session_id, SessionState.WAITING, SessionState.INTRO, 0
-        )
-        await self._websocket_hub.send_state_changed(
-            session_id, SessionState.WAITING.value, SessionState.INTRO.value
-        )
-
-        # Add small delay before intro
-        await asyncio.sleep(payload.config.intro_delay_seconds)
-
-        return SessionState.INTRO
-
-    async def _state_intro(
-        self, session_id: str, payload: SessionCreateRequest
-    ) -> SessionState:
-        """INTRO state: Generate and deliver greeting."""
-        # Generate greeting
-        greeting = await self._question_service.generate_greeting(
-            candidate_id=payload.candidate_id,
-            job_id=payload.job_id,
-        )
-
-        # Store greeting in session
-        async with self._session_factory() as session:
-            result = await session.execute(
-                select(InterviewSession).where(InterviewSession.id == session_id)
-            )
-            interview_session = result.scalar_one_or_none()
-            if interview_session:
-                interview_session.greeting_text = greeting
-                await session.commit()
-
-        self._logger.info(
-            json.dumps(
-                {
-                    "event": "greeting_delivered",
-                    "session_id": session_id,
-                    "greeting": greeting[:100],
-                }
-            )
-        )
-
-        # Notify clients of new greeting
         await self._websocket_hub.broadcast(
             session_id,
-            {
-                "event": "greeting_delivered",
-                "greeting": greeting,
-            },
+            LiveEventEnvelope(event="state_changed", payload=payload),
         )
 
-        # Small delay then transition to ASKING
-        await asyncio.sleep(payload.config.intro_delay_seconds)
-
-        await self._update_session_state(
-            session_id, SessionState.INTRO, SessionState.ASKING, 0
-        )
-        await self._websocket_hub.send_state_changed(
-            session_id, SessionState.INTRO.value, SessionState.ASKING.value
-        )
-
-        return SessionState.ASKING
-
-    async def _state_asking(
-        self, session_id: str, payload: SessionCreateRequest, question_number: int
-    ) -> SessionState:
-        """ASKING state: Generate and deliver question."""
-        q_num = question_number + 1
-
-        # Get context from history
-        context_service = self._active_sessions.get(session_id, {}).get("context")
-        context = context_service.get_history() if context_service else []
-
-        # Generate question
-        question = await self._question_service.generate_question(
-            job_id=payload.job_id,
-            question_number=q_num,
-            context=context,
+    async def _publish_event(self, session_id: str, event: str, payload: dict[str, Any]) -> None:
+        async with self._session_factory() as db:
+            await self._append_event(db, session_id, event, payload)
+            await db.commit()
+        await self._websocket_hub.broadcast(
+            session_id,
+            LiveEventEnvelope(event=event, payload=payload),
         )
 
-        # Store question in session
-        async with self._session_factory() as session:
-            result = await session.execute(
-                select(InterviewSession).where(InterviewSession.id == session_id)
-            )
-            interview_session = result.scalar_one_or_none()
-            if interview_session:
-                interview_session.current_question_number = q_num
-                interview_session.current_question_text = question
-                await session.commit()
-
+    async def _publish_answer_received(
+        self,
+        session_id: str,
+        question: str,
+        answer: str,
+        *,
+        skipped: bool,
+    ) -> None:
+        payload = {"question": question, "answer": answer, "skipped": skipped}
         self._logger.info(
             json.dumps(
                 {
-                    "event": "question_delivered",
+                    "event": "answer_received",
                     "session_id": session_id,
-                    "question_number": q_num,
-                    "question": question[:100],
+                    "question": question,
+                    "answer": answer,
+                    "skipped": skipped,
+                    "timestamp": utc_now().isoformat(),
+                }
+            )
+        )
+        await self._publish_event(session_id, "answer_received", payload)
+        await self._publish_event(session_id, "answer_transcribed", payload)
+
+    async def _append_event(
+        self,
+        db: AsyncSession,
+        session_id: str,
+        event: str,
+        payload: dict[str, Any],
+    ) -> None:
+        db.add(SessionEvent(session_id=session_id, event=event, payload=payload))
+        await db.flush()
+
+    async def _finalize_completion(self, session_id: str) -> None:
+        await self._publish_event(
+            session_id,
+            "session_ended",
+            {"status": SessionState.ENDED.value, "timestamp": utc_now().isoformat()},
+        )
+
+    async def _handle_failure(self, session_id: str, exc: Exception) -> None:
+        error_message = str(exc) or exc.__class__.__name__
+        timestamp = utc_now().isoformat()
+        async with self._session_factory() as db:
+            session = await self._get_session_for_update(db, session_id)
+            previous_state = session.status
+            session.state = SessionState.ERROR.value
+            session.status = SessionState.ERROR.value
+            session.error_reason = error_message
+            session.ended_reason = "error"
+            session.ended_at = utc_now()
+            session.duration_seconds = self._current_duration_seconds(session)
+            session.current_question_text = None
+            session.is_running = False
+            await self._append_event(
+                db,
+                session_id,
+                "state_changed",
+                {
+                    "from": previous_state,
+                    "to": SessionState.ERROR.value,
+                    "reason": "exception",
+                    "timestamp": timestamp,
+                    "error": error_message,
+                },
+            )
+            await db.commit()
+
+        self._logger.error(
+            json.dumps(
+                {
+                    "event": "fsm_error",
+                    "session_id": session_id,
+                    "status": SessionState.ERROR.value,
+                    "error": error_message,
+                    "timestamp": timestamp,
                 }
             )
         )
 
-        # Notify clients of new question
-        await self._websocket_hub.send_question_delivered(
-            session_id, question, q_num
-        )
-
-        # Small delay then transition to LISTENING
-        await asyncio.sleep(payload.config.question_delivery_delay_seconds)
-
-        await self._update_session_state(
-            session_id, SessionState.ASKING, SessionState.LISTENING, q_num
-        )
-        await self._websocket_hub.send_state_changed(
-            session_id, SessionState.ASKING.value, SessionState.LISTENING.value, q_num
-        )
-
-        return SessionState.LISTENING
-
-    async def _state_listening(
-        self, session_id: str, payload: SessionCreateRequest
-    ) -> SessionState:
-        """LISTENING state: Wait for candidate answer (non-blocking).
-        
-        This state DOES NOT transition automatically.
-        It waits for the /answer endpoint to be called.
-        """
-        # Wait for answer signal or timeout
-        event = self._answer_events.get(session_id)
-        if not event:
-            # Should not happen, but handle gracefully
-            self._logger.warning(
-                json.dumps(
-                    {
-                        "event": "listening_state_no_event",
-                        "session_id": session_id,
-                    }
-                )
-            )
-            return SessionState.ERROR
-
-        # Clear the event from previous use
-        event.clear()
-
-        # Wait for answer submission (with timeout)
-        try:
-            await asyncio.wait_for(
-                event.wait(),
-                timeout=payload.config.answer_timeout_seconds,
-            )
-        except asyncio.TimeoutError:
-            self._logger.warning(
-                json.dumps(
-                    {
-                        "event": "listening_timeout",
-                        "session_id": session_id,
-                        "timeout_seconds": payload.config.answer_timeout_seconds,
-                    }
-                )
-            )
-            # For now, treat timeout as session end
-            # TODO: Implement configurable timeout behavior
-            return SessionState.WRAPPING
-
-        # Answer was submitted, retrieve it
-        answer = self._pending_answers.pop(session_id, "")
-
-        if not answer:
-            self._logger.error(
-                json.dumps(
-                    {
-                        "event": "listening_no_answer_found",
-                        "session_id": session_id,
-                    }
-                )
-            )
-            return SessionState.ERROR
-
-        # Store answer temporarily for EVALUATING state
-        self._pending_answers[session_id] = answer
-
-        await self._update_session_state(
-            session_id, SessionState.LISTENING, SessionState.EVALUATING
-        )
-        await self._websocket_hub.send_state_changed(
-            session_id, SessionState.LISTENING.value, SessionState.EVALUATING.value
-        )
-
-        return SessionState.EVALUATING
-
-    async def _state_evaluating(
-        self, session_id: str, payload: SessionCreateRequest, question_number: int
-    ) -> SessionState:
-        """EVALUATING state: Evaluate answer and store score."""
-        # Retrieve stored answer
-        answer = self._pending_answers.pop(session_id, "")
-
-        async with self._session_factory() as session:
-            result = await session.execute(
-                select(InterviewSession).where(InterviewSession.id == session_id)
-            )
-            interview_session = result.scalar_one_or_none()
-            if not interview_session:
-                return SessionState.ERROR
-
-            question = interview_session.current_question_text or ""
-
-            # Get context for evaluation
-            context_service = self._active_sessions.get(session_id, {}).get("context")
-            context = context_service.get_history() if context_service else []
-
-            # Evaluate answer
-            evaluation = await self._evaluation_service.evaluate_answer(
-                question=question,
-                answer=answer,
-                context=context,
-            )
-
-            # Store in context
-            if context_service:
-                context_service.add_qa_pair(
-                    question=question,
-                    answer=answer,
-                    score=evaluation.score,
-                    feedback=evaluation.feedback,
-                    question_number=question_number + 1,
-                )
-
-            self._logger.info(
-                json.dumps(
-                    {
-                        "event": "answer_evaluated",
-                        "session_id": session_id,
-                        "question_number": question_number + 1,
-                        "score": evaluation.score,
-                        "feedback": evaluation.feedback,
-                    }
-                )
-            )
-
-            # Notify clients of evaluation
-            await self._websocket_hub.send_answer_evaluated(
-                session_id,
-                evaluation.score,
-                evaluation.feedback,
-                SessionState.DECISION.value,
-            )
-
-        await self._update_session_state(
-            session_id, SessionState.EVALUATING, SessionState.DECISION
-        )
-
-        return SessionState.DECISION
-
-    async def _state_decision(
-        self, session_id: str, payload: SessionCreateRequest, question_number: int
-    ) -> SessionState:
-        """DECISION state: Decide next action based on score."""
-        from fsm.decision import decide_next_action
-
-        async with self._session_factory() as session:
-            result = await session.execute(
-                select(InterviewSession).where(InterviewSession.id == session_id)
-            )
-            interview_session = result.scalar_one_or_none()
-            if not interview_session:
-                return SessionState.ERROR
-
-            # Get last score from context
-            context_service = self._active_sessions.get(session_id, {}).get("context")
-            history = context_service.get_history() if context_service else []
-            last_score = history[-1].get("score", 5) if history else 5
-
-            # Decide next action
-            decision = decide_next_action(
-                score=last_score,
-                question_number=question_number + 1,
-                config=interview_session.config,
-            )
-
-            self._logger.info(
-                json.dumps(
-                    {
-                        "event": "decision_made",
-                        "session_id": session_id,
-                        "score": last_score,
-                        "question_number": question_number + 1,
-                        "decision": decision,
-                    }
-                )
-            )
-
-            # Route based on decision
-            if decision == "FOLLOWUP":
-                return SessionState.FOLLOWUP
-            elif decision == "WRAPPING":
-                return SessionState.WRAPPING
-            else:  # NEXT, HARDER
-                return SessionState.ASKING
-
-    async def _state_followup(
-        self, session_id: str, payload: SessionCreateRequest
-    ) -> SessionState:
-        """FOLLOWUP state: Generate and deliver follow-up question."""
-        async with self._session_factory() as session:
-            result = await session.execute(
-                select(InterviewSession).where(InterviewSession.id == session_id)
-            )
-            interview_session = result.scalar_one_or_none()
-            if not interview_session:
-                return SessionState.ERROR
-
-            question = interview_session.current_question_text or ""
-
-            # Get context
-            context_service = self._active_sessions.get(session_id, {}).get("context")
-            history = context_service.get_history() if context_service else []
-            last_item = history[-1] if history else {}
-            answer = last_item.get("answer", "")
-            feedback = last_item.get("feedback", "")
-
-            # Generate followup
-            followup_question = await self._question_service.generate_followup(
-                original_question=question,
-                candidate_answer=answer,
-                evaluation_feedback=feedback,
-                context=history,
-            )
-
-            # Store followup as next question
-            interview_session.current_question_text = followup_question
-            await session.commit()
-
-            self._logger.info(
-                json.dumps(
-                    {
-                        "event": "followup_generated",
-                        "session_id": session_id,
-                        "followup_question": followup_question[:100],
-                    }
-                )
-            )
-
-            # Proceed to ASKING with followup question
-            await self._update_session_state(
-                session_id,
-                SessionState.FOLLOWUP,
-                SessionState.ASKING,
-            )
-
-        await asyncio.sleep(payload.config.question_delivery_delay_seconds)
-
-        return SessionState.ASKING
-
-    async def _state_wrapping(
-        self, session_id: str, payload: SessionCreateRequest
-    ) -> SessionState:
-        """WRAPPING state: Generate closing and end session."""
-        closing = (
-            "Thank you for your time today. We've covered a lot of ground. "
-            "You'll hear back from us within 2-3 business days. Best of luck!"
-        )
-
-        self._logger.info(
-            json.dumps(
-                {
-                    "event": "interview_closing",
-                    "session_id": session_id,
-                    "closing": closing,
-                }
-            )
-        )
-
-        await self._websocket_hub.send_session_ended(session_id, "completed")
-
-        await self._update_session_state(
-            session_id, SessionState.WRAPPING, SessionState.ENDED
-        )
-
-        return SessionState.ENDED
-
-    # ===== Persistence Helpers =====
-
-    async def _update_session_state(
+    def _resolve_decision(
         self,
-        session_id: str,
-        old_state: SessionState,
-        new_state: SessionState,
-        question_number: int | None = None,
-    ) -> None:
-        """Update session state in database."""
-        try:
-            async with self._session_factory() as session:
-                result = await session.execute(
-                    select(InterviewSession).where(InterviewSession.id == session_id)
-                )
-                interview_session = result.scalar_one_or_none()
-                if interview_session:
-                    interview_session.state = new_state.value
-                    interview_session.status = new_state.value
-                    if question_number is not None:
-                        interview_session.current_question_number = question_number
-                    await session.commit()
-        except Exception as exc:
-            self._logger.error(
-                json.dumps(
-                    {
-                        "event": "state_update_failed",
-                        "session_id": session_id,
-                        "from_state": old_state.value,
-                        "to_state": new_state.value,
-                        "error": str(exc),
-                    }
-                )
-            )
+        *,
+        score: int,
+        question_number: int,
+        config: dict[str, int],
+        runtime: SessionRuntime,
+        session_started_at: datetime | None,
+    ) -> str:
+        max_questions = config[CONFIG_KEY_MAX_QUESTIONS]
+        if runtime.force_wrap:
+            runtime.force_wrap = False
+            runtime.skip_question = False
+            return Decision.WRAPPING.value
+        if runtime.skip_question:
+            runtime.skip_question = False
+            if question_number >= max_questions:
+                return Decision.WRAPPING.value
+            return Decision.NEXT.value
+        if session_started_at is not None:
+            elapsed_seconds = int((utc_now() - session_started_at).total_seconds())
+            if elapsed_seconds >= config["max_duration_minutes"] * 60:
+                return Decision.WRAPPING.value
+        return decide_next_action(score, question_number, config)
 
-    async def _finalize_session(
+    async def _evaluate_answer(
         self,
+        session: InterviewSession,
+        runtime: SessionRuntime,
+        *,
+        question: str,
+        answer: str,
+    ) -> EvaluationResult:
+        if session.force_followup_test and not runtime.forced_followup_used:
+            runtime.forced_followup_used = True
+            return EvaluationResult(
+                score=3,
+                feedback="Forced follow-up test.",
+                overall_score=24,
+                red_flags=["forced_followup_test"],
+                needs_followup=True,
+                followup_reason="Forced follow-up test mode is active.",
+            )
+        return await self._evaluation_service.evaluate_answer(
+            question=question,
+            answer=answer,
+            context=list(runtime.interaction_history),
+        )
+
+    async def _get_session(self, session_id: str) -> InterviewSession:
+        async with self._session_factory() as db:
+            result = await db.execute(
+                select(InterviewSession).where(InterviewSession.id == session_id)
+            )
+            session = result.scalar_one_or_none()
+            if session is None:
+                raise HTTPException(status_code=404, detail="Session not found")
+            return session
+
+    async def _get_session_for_update(
+        self,
+        db: AsyncSession,
         session_id: str,
-        final_state: SessionState,
-        duration_seconds: int,
-        error_reason: str | None = None,
-    ) -> None:
-        """Finalize session after completion."""
-        try:
-            async with self._session_factory() as session:
-                result = await session.execute(
-                    select(InterviewSession).where(InterviewSession.id == session_id)
-                )
-                interview_session = result.scalar_one_or_none()
-                if interview_session:
-                    interview_session.state = final_state.value
-                    interview_session.status = final_state.value
-                    interview_session.duration_seconds = duration_seconds
-                    interview_session.is_running = False
-                    interview_session.ended_at = datetime.now(timezone.utc)
-                    if error_reason:
-                        interview_session.error_reason = error_reason
-                    if final_state == SessionState.ENDED:
-                        interview_session.ended_reason = "completed"
-                    await session.commit()
+    ) -> InterviewSession:
+        result = await db.execute(
+            select(InterviewSession)
+            .where(InterviewSession.id == session_id)
+            .with_for_update()
+        )
+        session = result.scalar_one_or_none()
+        if session is None:
+            raise HTTPException(status_code=404, detail="Session not found")
+        return session
 
-            self._logger.info(
-                json.dumps(
-                    {
-                        "event": "session_finalized",
-                        "session_id": session_id,
-                        "final_state": final_state.value,
-                        "duration_seconds": duration_seconds,
-                        "error_reason": error_reason,
-                    }
-                )
-            )
+    def _ensure_not_terminal(self, session: InterviewSession) -> None:
+        if SessionState(session.status) in TERMINAL_STATES:
+            raise HTTPException(status_code=409, detail="Session is already terminal")
 
-            # Notify clients
-            if final_state == SessionState.ERROR:
-                await self._websocket_hub.send_session_error(
-                    session_id, error_reason or "Unknown error"
+    def _validate_command(self, command: RecruiterCommand, session: InterviewSession) -> None:
+        state = SessionState(session.status)
+        if command == RecruiterCommand.PAUSE:
+            if state == SessionState.WRAPPING:
+                raise HTTPException(status_code=409, detail="Cannot pause while wrapping")
+            return
+        if command == RecruiterCommand.SKIP_QUESTION:
+            if state not in {SessionState.ASKING, SessionState.LISTENING}:
+                raise HTTPException(
+                    status_code=409,
+                    detail="skip_question is only allowed while asking or listening",
                 )
-            else:
-                await self._websocket_hub.send_session_ended(
-                    session_id, "completed"
-                )
+            return
+        if command == RecruiterCommand.END_INTERVIEW:
+            if state == SessionState.WRAPPING:
+                raise HTTPException(status_code=409, detail="Session is already wrapping")
+            return
 
-        except Exception as exc:
-            self._logger.error(
-                json.dumps(
-                    {
-                        "event": "session_finalization_failed",
-                        "session_id": session_id,
-                        "error": str(exc),
-                    }
-                )
-            )
+    def _runtime_for(self, session_id: str) -> SessionRuntime:
+        runtime = self._runtimes.get(session_id)
+        if runtime is None:
+            runtime = SessionRuntime(session_id=session_id)
+            self._runtimes[session_id] = runtime
+        return runtime
+
+    def _cleanup_runtime(self, session_id: str) -> None:
+        runtime = self._runtimes.pop(session_id, None)
+        if runtime is not None:
+            runtime.cancel_scheduled()
+
+    def _to_status_response(self, session: InterviewSession) -> SessionStatusResponse:
+        return SessionStatusResponse(
+            session_id=session.id,
+            state=session.status,
+            current_question_number=session.current_question_number,
+            duration_seconds=max(session.duration_seconds, self._current_duration_seconds(session)),
+            max_questions=session.max_questions,
+            max_duration_minutes=session.max_duration_minutes,
+            ended_reason=session.ended_reason,
+        )
+
+    def _session_config(self, session: InterviewSession) -> dict[str, int]:
+        config = dict(session.config or {})
+        config[CONFIG_KEY_MAX_QUESTIONS] = session.max_questions
+        config["max_duration_minutes"] = session.max_duration_minutes
+        config["fsm_start_delay_seconds"] = int(config.get("fsm_start_delay_seconds", 1))
+        config["intro_timeout_seconds"] = int(config.get("intro_timeout_seconds", 15))
+        config["question_delivery_timeout_seconds"] = int(config.get("question_delivery_timeout_seconds", 15))
+        config["answer_timeout_seconds"] = int(config.get("answer_timeout_seconds", 30))
+        config["intro_delay_seconds"] = int(config.get("intro_delay_seconds", 1))
+        config["question_delivery_delay_seconds"] = int(config.get("question_delivery_delay_seconds", 1))
+        config["answer_capture_delay_seconds"] = int(config.get("answer_capture_delay_seconds", 1))
+        config[CONFIG_KEY_FOLLOWUP_SCORE_MAX] = int(config.get(CONFIG_KEY_FOLLOWUP_SCORE_MAX, 4))
+        config[CONFIG_KEY_NEXT_SCORE_MIN] = int(config.get(CONFIG_KEY_NEXT_SCORE_MIN, 8))
+        return config
+
+    def _listening_timeout_seconds(self, session: InterviewSession, config: dict[str, int]) -> int:
+        started_at = session.started_at or utc_now()
+        elapsed = int((utc_now() - started_at).total_seconds())
+        remaining = max((config["max_duration_minutes"] * 60) - elapsed, 1)
+        return remaining
+
+    def _current_duration_seconds(self, session: InterviewSession) -> int:
+        started_at = session.started_at or session.created_at
+        finished_at = session.ended_at or utc_now()
+        return max(int((finished_at - started_at).total_seconds()), 0)

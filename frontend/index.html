@@ -1,0 +1,35 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>AI Interview Assistant</title>
+    <link rel="stylesheet" href="style.css">
+</head>
+<body>
+    <div class="chat-container">
+        <header class="chat-header">
+            <div class="header-info">
+                <h2>AI Interview Assistant</h2>
+                <span class="status" id="status-indicator">Offline</span>
+            </div>
+            <button id="start-btn" class="start-btn">Start Interview</button>
+        </header>
+        
+        <div id="chat-box" class="chat-box">
+            <div class="message system-msg">
+                Welcome! Click "Start Interview" to begin your session.
+            </div>
+        </div>
+
+        <div class="input-area">
+            <textarea id="user-input" placeholder="Type your answer here..." disabled></textarea>
+            <button id="send-btn" disabled>
+                <svg viewBox="0 0 24 24" width="24" height="24" stroke="currentColor" stroke-width="2" fill="none" stroke-linecap="round" stroke-linejoin="round" class="css-i6dzq1"><line x1="22" y1="2" x2="11" y2="13"></line><polygon points="22 2 15 22 11 13 2 9 22 2"></polygon></svg>
+            </button>
+        </div>
+    </div>
+    
+    <script src="script.js"></script>
+</body>
+</html>
