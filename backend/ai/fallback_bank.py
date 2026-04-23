@@ -1,11 +1,8 @@
 from __future__ import annotations
 
-import json
-from pathlib import Path
-from typing import Any
+from services.question_bank_service import AdaptiveQuestionService
 
-
-QUESTION_BANK_PATH = Path(__file__).resolve().parents[2] / "data" / "question_bank.json"
+_service = AdaptiveQuestionService()
 
 
 def get_fallback_question(
@@ -14,41 +11,20 @@ def get_fallback_question(
     topic: str,
     previous_questions: list[str],
 ) -> str:
-    bank = _load_question_bank()
-    role = _resolve_role(job_id)
-    topic_questions = (
-        bank.get(role, {}).get(topic)
-        or bank.get("default", {}).get(topic)
-        or bank.get("default", {}).get("behavioural")
-        or ["Tell me about a challenge you handled and what you learned from it."]
+    """Legacy adapter: delegates to AdaptiveQuestionService."""
+    role_level = _resolve_role_level(job_id)
+    return _service.get_question(
+        topic,
+        role_level,
+        session_id=f"legacy_{job_id}",
+        asked_questions=previous_questions,
     )
 
-    normalized_previous = {
-        _normalize(question)
-        for question in previous_questions
-        if _normalize(question)
-    }
-    for question in topic_questions:
-        if _normalize(question) not in normalized_previous:
-            return question
-    return topic_questions[0]
 
-
-def _load_question_bank() -> dict[str, Any]:
-    with QUESTION_BANK_PATH.open("r", encoding="utf-8") as handle:
-        return json.load(handle)
-
-
-def _resolve_role(job_id: str) -> str:
+def _resolve_role_level(job_id: str) -> str:
     normalized = (job_id or "").strip().lower()
-    if any(token in normalized for token in ("backend", "api", "python", "java", "service")):
-        return "backend"
-    if any(token in normalized for token in ("frontend", "react", "ui", "web")):
-        return "frontend"
-    if any(token in normalized for token in ("data", "etl", "analytics", "ml")):
-        return "data"
-    return "default"
-
-
-def _normalize(value: str) -> str:
-    return " ".join((value or "").strip().lower().split())
+    if any(token in normalized for token in ("junior", "intern", "entry", "fresher", "fresh_grad")):
+        return "fresher"
+    if any(token in normalized for token in ("senior", "lead", "staff", "principal")):
+        return "senior"
+    return "mid"

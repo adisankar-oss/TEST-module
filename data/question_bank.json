@@ -1,90 +1,138 @@
 {
-  "default": {
-    "background": [
-      "Tell me about yourself and the type of work you have focused on recently.",
-      "What kind of problems do you most enjoy working on, and why?"
+  "technical_skills": {
+    "easy": [
+      "What programming languages are you most comfortable with, and why did you choose to learn them?",
+      "Can you explain the difference between a stack and a queue, and give a real-world example of each?",
+      "How would you explain the concept of version control to someone who has never used it?",
+      "What is the difference between a compiled language and an interpreted language?",
+      "Describe the HTTP request-response cycle in your own words.",
+      "What are the basic principles of object-oriented programming, and can you give an example of each?",
+      "How do you approach writing unit tests for a function you have just implemented?",
+      "What is the difference between an array and a linked list, and when would you use each?",
+      "Can you explain what an API is and why it matters in software development?"
     ],
-    "behavioural": [
-      "Describe a challenging situation at work and how you handled it.",
-      "Tell me about a time you had to make progress despite incomplete information."
+    "medium": [
+      "How do you decide between a SQL and NoSQL database for a new feature?",
+      "Describe your approach to designing RESTful APIs that are easy to evolve over time.",
+      "How do you handle database migrations in a production environment without downtime?",
+      "Explain how you would implement authentication and authorization in a microservices architecture.",
+      "What strategies do you use to manage technical debt while still delivering features on schedule?",
+      "How do you approach performance profiling and optimization in a backend service?",
+      "Describe a time you had to refactor a poorly designed module. What was your approach?",
+      "How do you design a caching layer to reduce database load without serving stale data?",
+      "What factors do you consider when choosing between synchronous and asynchronous processing?"
     ],
-    "technical_skills": [
-      "What skill has been most important in your recent work, and how have you improved it?",
-      "Walk me through a technical decision you made recently and what tradeoffs you considered."
-    ],
-    "problem_solving": [
-      "Describe how you approach a problem when the root cause is not obvious.",
-      "Tell me about a time you had to debug a difficult issue under time pressure."
-    ],
-    "culture_fit": [
-      "What kind of team environment helps you do your best work?",
-      "How do you build trust when joining a new team or project?"
-    ],
-    "wrapup": [
-      "What is one area you are actively trying to improve in your work right now?",
-      "What would you want your next manager or team to understand about how you work best?"
+    "hard": [
+      "How do you design a system to handle ten times its current traffic without a full rewrite?",
+      "Describe your approach to designing event-driven architectures and the trade-offs involved.",
+      "How do you evaluate and introduce a new technology into an existing production stack?",
+      "What is your strategy for ensuring data consistency across distributed microservices?",
+      "How do you approach building a platform that other engineering teams will build upon?",
+      "Describe how you would architect a real-time data pipeline that guarantees exactly-once processing.",
+      "How do you balance system reliability with the speed of feature delivery at a senior level?",
+      "How would you design a multi-region active-active database architecture with conflict resolution?",
+      "Describe your approach to implementing zero-downtime deployments for stateful services."
     ]
   },
-  "backend": {
-    "background": [
-      "Tell me about your background in backend systems and the services you have worked on recently."
+  "problem_solving": {
+    "easy": [
+      "Describe how you would debug a program that compiles but produces incorrect output.",
+      "If a web page loads slowly, what steps would you take to identify the cause?",
+      "How would you approach solving a coding problem you have never encountered before?",
+      "You are given a dataset with missing values. How would you decide what to do with them?",
+      "Walk me through how you would break down a large task into smaller, manageable pieces.",
+      "A feature you built works locally but fails in production. What steps do you take first?",
+      "How do you decide when to stop researching a problem and start implementing a solution?"
     ],
-    "behavioural": [
-      "Describe a time you had to coordinate a backend change across teams with competing priorities."
+    "medium": [
+      "You notice a sudden spike in error rates after a deployment. Walk me through your investigation process.",
+      "How would you design a retry mechanism for a service that calls an unreliable third-party API?",
+      "Describe how you would troubleshoot a memory leak in a long-running production service.",
+      "A critical batch job starts failing intermittently. How do you approach diagnosing the root cause?",
+      "How do you handle a situation where two proposed solutions to a problem each have significant trade-offs?",
+      "A database query that used to run in milliseconds now takes seconds. How do you investigate?",
+      "How do you approach debugging a race condition that only appears under heavy load?"
     ],
-    "technical_skills": [
-      "How do you design a backend service to stay reliable under high concurrent traffic?",
-      "What tradeoffs do you consider when choosing a database consistency model for a critical workflow?"
-    ],
-    "problem_solving": [
-      "You notice a sudden increase in API latency after a deployment. How would you isolate the cause?",
-      "How would you redesign a backend workflow that is failing intermittently under load?"
-    ],
-    "culture_fit": [
-      "How do you handle disagreement during architecture discussions while keeping delivery moving?"
-    ],
-    "wrapup": [
-      "What kind of engineering culture helps you produce your best backend work?"
+    "hard": [
+      "Describe a time when you identified a systemic architectural issue and drove its resolution across teams.",
+      "How do you approach capacity planning for a system with unpredictable traffic patterns?",
+      "A production incident reveals a fundamental design flaw. How do you prioritize the fix against feature work?",
+      "How do you design monitoring and alerting strategies that catch real problems without creating alert fatigue?",
+      "Describe your approach to leading a post-mortem process that drives actual systemic improvements.",
+      "How would you diagnose and resolve cascading failures across interdependent microservices?",
+      "Describe how you would design a chaos engineering practice for a critical production system."
     ]
   },
-  "frontend": {
-    "background": [
-      "Tell me about the frontend products or interfaces you have been working on recently."
+  "behavioral": {
+    "easy": [
+      "Tell me about a project you worked on that you are particularly proud of. What was your contribution?",
+      "Describe a time when you received constructive criticism. How did you respond?",
+      "How do you manage your time when you have multiple assignments or deadlines?",
+      "Tell me about a time you had to learn a new technology quickly. What was your approach?",
+      "Describe a situation where you had to work with someone whose working style was different from yours.",
+      "What do you do when you are stuck on a problem and cannot figure it out on your own?",
+      "Tell me about a mistake you made early in your career and what you learned from it."
     ],
-    "behavioural": [
-      "Describe a time you had to balance product pressure with frontend quality or accessibility."
+    "medium": [
+      "Tell me about a time you had to push back on a requirement because it conflicted with technical constraints.",
+      "Describe a situation where you had to mentor a junior team member through a difficult task.",
+      "How do you handle disagreements during code reviews or design discussions?",
+      "Tell me about a time when you had to make a significant technical decision under uncertainty.",
+      "Describe a project where the requirements changed significantly mid-development. How did you adapt?",
+      "Tell me about a time you identified a risk that others had overlooked. How did you communicate it?",
+      "Describe a situation where you had to deliver results with incomplete requirements."
     ],
-    "technical_skills": [
-      "How do you structure state management in a complex frontend application without overcomplicating it?"
-    ],
-    "problem_solving": [
-      "A production UI becomes slow after a new release. How would you investigate the regression?"
-    ],
-    "culture_fit": [
-      "How do you collaborate with design and backend teams when requirements are still evolving?"
-    ],
-    "wrapup": [
-      "What kind of feedback loop helps you improve fastest as a frontend engineer?"
+    "hard": [
+      "Describe a time when you had to influence a technical direction without having direct authority.",
+      "Tell me about a situation where you had to balance competing priorities across multiple teams.",
+      "How do you approach building a culture of engineering excellence within your team?",
+      "Describe a difficult decision you made that had long-term consequences for your team or organization.",
+      "Tell me about a time when you had to deliver bad news about a project's timeline or feasibility to leadership.",
+      "Describe how you have navigated organizational change while keeping your team productive and motivated.",
+      "Tell me about a time you had to make a technical decision that was unpopular but ultimately correct."
     ]
   },
-  "data": {
-    "background": [
-      "Tell me about the kinds of data systems or analytical workflows you have worked on recently."
+  "culture_fit": {
+    "easy": [
+      "What kind of team environment helps you learn and grow the fastest?",
+      "How do you handle receiving feedback that you disagree with?",
+      "What motivates you to do your best work?",
+      "How do you prefer to communicate with your team when working on a shared project?",
+      "What does a supportive manager look like to you?"
     ],
-    "behavioural": [
-      "Describe a time you had to challenge a decision because the underlying data was unreliable."
+    "medium": [
+      "How do you build trust with teammates when joining a new team?",
+      "What does a healthy engineering culture look like to you?",
+      "How do you balance working independently with collaborating closely with your team?",
+      "Describe how you handle situations where the team consensus differs from your strong opinion.",
+      "How do you stay motivated during long projects with delayed outcomes?"
     ],
-    "technical_skills": [
-      "How do you design a data pipeline to handle delayed or malformed events safely?"
+    "hard": [
+      "How do you foster psychological safety on a team so that people speak up about risks?",
+      "What is your approach to creating an inclusive environment where diverse perspectives are valued?",
+      "How do you handle situations where organizational priorities conflict with your team's technical vision?",
+      "Describe how you have shaped or changed the culture of a team you have led.",
+      "How do you manage the tension between engineering ideals and business pragmatism?"
+    ]
+  },
+  "background": {
+    "easy": [
+      "Tell me about yourself and what drew you to a career in software engineering.",
+      "What projects or experiences from your education do you feel best prepared you for this role?",
+      "What areas of technology are you most excited to explore in your first professional role?",
+      "What inspired you to pursue this specific technical domain?"
     ],
-    "problem_solving": [
-      "A key metric drops unexpectedly after a pipeline change. How would you determine what happened?"
+    "medium": [
+      "Walk me through your career trajectory and the key transitions that shaped your skills.",
+      "What has been the most impactful project you have worked on, and what did you learn from it?",
+      "How has your approach to software development evolved over the past few years?",
+      "What is the most valuable lesson you have learned from a project that did not go as planned?"
     ],
-    "culture_fit": [
-      "How do you work with non-technical stakeholders when data findings are ambiguous?"
-    ],
-    "wrapup": [
-      "What kind of team environment helps you do your best work with data systems?"
+    "hard": [
+      "How have your responsibilities shifted as you have moved into more senior roles?",
+      "Describe the most complex system you have owned and how you ensured its long-term health.",
+      "What leadership lessons have you learned that you wish you had known earlier in your career?",
+      "How do you evaluate whether a role or company is the right fit for your growth trajectory?"
     ]
   }
 }
