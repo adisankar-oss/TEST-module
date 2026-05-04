@@ -9,7 +9,7 @@ from datetime import datetime, timezone
 from typing import Any
 from uuid import uuid4
 
-from fastapi import HTTPException, WebSocket, WebSocketDisconnect
+from fastapi import HTTPException, WebSocketDisconnect
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
@@ -221,53 +221,6 @@ class SessionRuntime:
         return None
 
 
-class WebSocketHub:
-    def __init__(self) -> None:
-        self._connections: dict[str, set[WebSocket]] = {}
-        self._lock = asyncio.Lock()
-
-    async def connect(self, session_id: str, websocket: WebSocket) -> None:
-        await websocket.accept()
-        async with self._lock:
-            self._connections.setdefault(session_id, set()).add(websocket)
-
-    async def disconnect(self, session_id: str, websocket: WebSocket) -> None:
-        async with self._lock:
-            sockets = self._connections.get(session_id)
-            if not sockets:
-                return
-            sockets.discard(websocket)
-            if not sockets:
-                self._connections.pop(session_id, None)
-
-    async def broadcast(self, session_id: str, envelope: LiveEventEnvelope) -> None:
-        async with self._lock:
-            sockets = list(self._connections.get(session_id, set()))
-
-        payload = envelope.model_dump()
-        dead_connections: list[WebSocket] = []
-        for websocket in sockets:
-            try:
-                await websocket.send_json(payload)
-            except Exception:
-                dead_connections.append(websocket)
-
-        for websocket in dead_connections:
-            await self.disconnect(session_id, websocket)
-
-    async def close_all(self) -> None:
-        async with self._lock:
-            sessions = list(self._connections.items())
-            self._connections.clear()
-
-        for _, websockets in sessions:
-            for websocket in websockets:
-                try:
-                    await websocket.close()
-                except Exception:
-                    pass
-
-
 class SessionEngine:
     def __init__(
         self,
@@ -417,21 +370,50 @@ class SessionEngine:
         return SessionEventResponse(session_id=session_id, status="resumed")
 
     async def handle_live_connection(self, websocket: WebSocket, session_id: str) -> None:
+        # Validate session exists BEFORE accepting the WebSocket.
+        # If we accept first and then fail, the browser sees code 1006
+        # because the connection is abandoned without a close frame.
+        try:
+            session = await self._get_session(session_id)
+        except HTTPException:
+            await websocket.close(code=4004, reason="Session not found")
+            return
+        except Exception as exc:
+            self._logger.error("WS pre-accept lookup failed for %s: %s", session_id, exc)
+            await websocket.close(code=1011, reason="Internal error")
+            return
+
         await self._websocket_hub.connect(session_id, websocket)
         try:
-            snapshot = await self.get_status(session_id)
+            # Send initial state snapshot so the client knows the current FSM state.
+            snapshot = self._to_status_response(session)
             await websocket.send_json(
                 LiveEventEnvelope(
                     event="session_snapshot",
                     payload=snapshot.model_dump(mode="json"),
                 ).model_dump()
             )
+
+            # Keep the connection alive.
+            # The FSM pushes events via _websocket_hub.broadcast(); this loop
+            # only needs to consume client frames so the connection stays open.
             while True:
-                await websocket.receive_text()
+                data = await websocket.receive_text()
+                # Respond to client-side keepalive pings.  Browsers and
+                # proxies may kill idle WebSocket connections after 30-60 s.
+                if data == "ping":
+                    await websocket.send_json({"event": "pong", "payload": {}})
         except WebSocketDisconnect:
+            pass
+        except Exception as exc:
+            self._logger.warning("WebSocket error for session %s: %s", session_id, exc)
+            try:
+                await websocket.close(code=1011, reason="Internal error")
+            except Exception:
+                pass  # already closed / broken pipe
+        finally:
             await self._websocket_hub.disconnect(session_id, websocket)
-        except Exception:
-            await self._websocket_hub.disconnect(session_id, websocket)
+
 
     async def shutdown(self) -> None:
         async with self._task_lock:

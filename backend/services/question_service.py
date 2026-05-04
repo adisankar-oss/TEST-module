@@ -234,8 +234,8 @@ class QuestionService:
                 raise ValueError("Generated question reused an overused concept")
             if question_type == "followup":
                 if followup_anchor is None:
-                    raise ValueError("Model marked follow-up without a valid anchor")
-                if followup_anchor not in candidate_question.lower():
+                    question_type = "new"
+                elif followup_anchor not in candidate_question.lower():
                     raise ValueError("Follow-up question was not anchored to the last answer")
             if question_type != "followup" and followup_anchor is not None:
                 question_topic = selected_topic

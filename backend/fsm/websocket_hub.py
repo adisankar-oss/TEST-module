@@ -52,15 +52,27 @@ class WebSocketHub:
             )
         )
 
-    async def broadcast(self, session_id: str, message: dict[str, Any]) -> None:
-        """Send a message to all connected clients for a session."""
+    async def broadcast(self, session_id: str, message: Any) -> None:
+        """Send a message to all connected clients for a session.
+
+        Accepts both plain dicts and Pydantic BaseModel instances
+        (e.g. LiveEventEnvelope from the FSM engine).
+        """
         if session_id not in self._active_connections:
             return
+
+        # Normalise to dict so send_json always gets a plain dict.
+        if hasattr(message, "model_dump"):
+            data = message.model_dump()
+        elif isinstance(message, dict):
+            data = message
+        else:
+            data = {"raw": str(message)}
 
         disconnected = set()
         for websocket in self._active_connections[session_id]:
             try:
-                await websocket.send_json(message)
+                await websocket.send_json(data)
             except (WebSocketDisconnect, RuntimeError):
                 disconnected.add(websocket)
 
@@ -152,3 +164,29 @@ class WebSocketHub:
                 "error_reason": error_reason,
             },
         )
+
+    async def close_all(self) -> None:
+        """Close all active WebSocket connections.
+
+        Called during server shutdown to ensure every connection receives
+        a clean close frame instead of an abnormal 1006 closure.
+        """
+        all_sessions = list(self._active_connections.items())
+        self._active_connections.clear()
+
+        for session_id, websockets in all_sessions:
+            for websocket in websockets:
+                try:
+                    await websocket.close(code=1001, reason="Server shutting down")
+                except Exception:
+                    pass
+            self._logger.info(
+                json.dumps(
+                    {
+                        "event": "websocket_close_all",
+                        "session_id": session_id,
+                        "closed_count": len(websockets),
+                    }
+                )
+            )
+
