@@ -1,15 +1,19 @@
 from __future__ import annotations
 
+import importlib.util
 from contextlib import asynccontextmanager
 
-from fastapi import Depends, FastAPI, HTTPException, Request, WebSocket
+from fastapi import Depends, FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 
 from database import AsyncSessionFactory, close_database, init_database
+from dependencies import get_session_engine
 from fsm.engine import SessionEngine
 from fsm.websocket_hub import WebSocketHub
 from fsm.transitions import RecruiterCommand
 from models import Base
+from routes import router as ws_router
 from schemas import (
     SessionAnswerRequest,
     SessionAnswerResponse,
@@ -23,14 +27,29 @@ from schemas import (
 from services.ai_client import AIClient
 from services.evaluation_service import EvaluationService
 from services.question_service import QuestionService
-from utils.logger import configure_logging
+from utils.logger import configure_logging, get_logger
+
+
+def websocket_runtime_available() -> bool:
+    return any(
+        importlib.util.find_spec(module_name) is not None
+        for module_name in ("websockets", "wsproto")
+    )
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     configure_logging()
+    logger = get_logger("main")
     await init_database(Base.metadata)
     ai_client = AIClient()
+
+    if not websocket_runtime_available():
+        logger.warning(
+            "WebSocket transport library not installed for this Python interpreter. "
+            "Use the project virtualenv Python to run uvicorn, or install "
+            "'uvicorn[standard]' / 'websockets' into the active interpreter."
+        )
 
     app.state.session_engine = SessionEngine(
         session_factory=AsyncSessionFactory,
@@ -59,14 +78,24 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-
-def get_session_engine(request: Request) -> SessionEngine:
-    return request.app.state.session_engine
+# Include WebSocket routes
+app.include_router(ws_router)
 
 
 @app.get("/")
 async def home() -> dict[str, str]:
     return {"message": "M1 Session Orchestrator service is running"}
+
+
+@app.get("/api/v1/sessions/{session_id}/live")
+async def session_live_upgrade_required(session_id: str) -> JSONResponse:
+    detail = (
+        "This endpoint is WebSocket-only. Connect with ws:// or wss:// instead of http://. "
+        "If the server logs 'No supported WebSocket library detected', start uvicorn with "
+        "C:\\ai-interview-avatar\\.venv\\Scripts\\python.exe -m uvicorn main:app "
+        "--host 127.0.0.1 --port 8000 --reload."
+    )
+    return JSONResponse(status_code=426, content={"session_id": session_id, "detail": detail})
 
 
 @app.post("/api/v1/sessions", response_model=SessionCreateResponse, status_code=201)
@@ -134,8 +163,3 @@ async def candidate_rejoined(
     session_engine: SessionEngine = Depends(get_session_engine),
 ) -> SessionEventResponse:
     return await session_engine.handle_candidate_reconnected(session_id)
-
-
-@app.websocket("/api/v1/sessions/{session_id}/live")
-async def session_live(websocket: WebSocket, session_id: str) -> None:
-    await websocket.app.state.session_engine.handle_live_connection(websocket, session_id)

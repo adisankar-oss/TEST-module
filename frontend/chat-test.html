@@ -1,0 +1,593 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Interview Chat – Test UI</title>
+  <style>
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+      background: #f5f5f5;
+      color: #1a1a1a;
+      height: 100vh;
+      display: flex;
+      flex-direction: column;
+    }
+
+    /* ── Header ── */
+    header {
+      background: #fff;
+      border-bottom: 1px solid #e0e0e0;
+      padding: 12px 20px;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      flex-shrink: 0;
+    }
+    header h1 { font-size: 16px; font-weight: 600; }
+    #status-badge {
+      font-size: 12px;
+      padding: 4px 10px;
+      border-radius: 12px;
+      background: #e8e8e8;
+      color: #666;
+    }
+    #status-badge.connected { background: #d4edda; color: #155724; }
+    #status-badge.error     { background: #f8d7da; color: #721c24; }
+    #status-badge.waiting   { background: #fff3cd; color: #856404; }
+
+    /* ── Setup Panel ── */
+    #setup-panel {
+      background: #fff;
+      border-bottom: 1px solid #e0e0e0;
+      padding: 12px 20px;
+      display: flex;
+      gap: 8px;
+      align-items: center;
+      flex-wrap: wrap;
+      flex-shrink: 0;
+    }
+    #setup-panel label { font-size: 13px; font-weight: 500; }
+    #setup-panel input, #setup-panel select {
+      font-size: 13px;
+      padding: 6px 10px;
+      border: 1px solid #ccc;
+      border-radius: 6px;
+      background: #fafafa;
+    }
+    #setup-panel input:focus, #setup-panel select:focus {
+      outline: none;
+      border-color: #4a90d9;
+    }
+    .btn {
+      font-size: 13px;
+      font-weight: 500;
+      padding: 6px 16px;
+      border: none;
+      border-radius: 6px;
+      cursor: pointer;
+      transition: opacity .15s;
+    }
+    .btn:disabled { opacity: .45; cursor: not-allowed; }
+    .btn-primary { background: #4a90d9; color: #fff; }
+    .btn-danger  { background: #dc3545; color: #fff; }
+
+    /* ── Controls Bar ── */
+    #controls {
+      background: #fff;
+      border-bottom: 1px solid #e0e0e0;
+      padding: 8px 20px;
+      display: none;
+      gap: 6px;
+      align-items: center;
+      flex-shrink: 0;
+      font-size: 12px;
+    }
+    #controls .state-label {
+      margin-right: auto;
+      font-weight: 600;
+      color: #333;
+    }
+
+    /* ── Chat Area ── */
+    #chat {
+      flex: 1;
+      overflow-y: auto;
+      padding: 20px;
+      display: flex;
+      flex-direction: column;
+      gap: 10px;
+    }
+
+    .msg {
+      max-width: 75%;
+      padding: 10px 14px;
+      border-radius: 12px;
+      font-size: 14px;
+      line-height: 1.5;
+      word-wrap: break-word;
+      white-space: pre-wrap;
+    }
+    .msg.system {
+      align-self: center;
+      max-width: 90%;
+      background: #eef;
+      color: #555;
+      font-size: 12px;
+      border-radius: 8px;
+      text-align: center;
+    }
+    .msg.ai {
+      align-self: flex-start;
+      background: #fff;
+      border: 1px solid #e0e0e0;
+    }
+    .msg.user {
+      align-self: flex-end;
+      background: #4a90d9;
+      color: #fff;
+    }
+    .msg .meta {
+      font-size: 11px;
+      margin-bottom: 4px;
+      opacity: .6;
+    }
+    .msg .score-badge {
+      display: inline-block;
+      margin-top: 6px;
+      font-size: 11px;
+      padding: 2px 8px;
+      border-radius: 8px;
+      background: #eef;
+      color: #333;
+    }
+
+    /* ── Input Bar ── */
+    #input-bar {
+      background: #fff;
+      border-top: 1px solid #e0e0e0;
+      padding: 12px 20px;
+      display: flex;
+      gap: 8px;
+      flex-shrink: 0;
+    }
+    #msg-input {
+      flex: 1;
+      font-size: 14px;
+      padding: 10px 14px;
+      border: 1px solid #ccc;
+      border-radius: 8px;
+      resize: none;
+      font-family: inherit;
+    }
+    #msg-input:focus { outline: none; border-color: #4a90d9; }
+    #send-btn { padding: 10px 20px; font-size: 14px; }
+  </style>
+</head>
+<body>
+
+  <!-- Header -->
+  <header>
+    <h1>🎤 Interview Chat Test</h1>
+    <span id="status-badge">Disconnected</span>
+  </header>
+
+  <!-- Setup -->
+  <div id="setup-panel">
+    <label>API:</label>
+    <input id="api-url" type="text" value="http://127.0.0.1:8000" style="width:220px" />
+    <label>Candidate:</label>
+    <input id="candidate-id" type="text" value="test-candidate-1" style="width:140px" />
+    <label>Job:</label>
+    <input id="job-id" type="text" value="test-job-1" style="width:120px" />
+    <label>Type:</label>
+    <select id="meeting-type">
+      <option value="daily">daily</option>
+      <option value="google_meet">google_meet</option>
+      <option value="zoom">zoom</option>
+    </select>
+    <button id="create-btn" class="btn btn-primary" onclick="createSession()">Create &amp; Start Session</button>
+  </div>
+
+  <!-- Recruiter Controls (shown after session starts) -->
+  <div id="controls">
+    <span class="state-label" id="state-label">State: —</span>
+    <button id="cmd-pause"    class="btn btn-primary" onclick="sendCommand('pause')"         disabled>⏸ Pause</button>
+    <button id="cmd-resume"   class="btn btn-primary" onclick="sendCommand('resume')"        disabled>▶ Resume</button>
+    <button id="cmd-skip"     class="btn btn-primary" onclick="sendCommand('skip_question')" disabled>⏭ Skip</button>
+    <button id="cmd-extend"   class="btn btn-primary" onclick="sendCommand('extend_5min')"   disabled>⏱ +5 min</button>
+    <button id="cmd-end"      class="btn btn-danger"  onclick="sendCommand('end_interview')" disabled>⏹ End</button>
+  </div>
+
+  <!-- Chat -->
+  <div id="chat"></div>
+
+  <!-- Input -->
+  <div id="input-bar">
+    <textarea id="msg-input" rows="1" placeholder="Type your answer…" disabled
+      onkeydown="if(event.key==='Enter'&&!event.shiftKey){event.preventDefault();sendAnswer()}"></textarea>
+    <button id="send-btn" class="btn btn-primary" onclick="sendAnswer()" disabled>Send</button>
+  </div>
+
+<script>
+  // ── State ──
+  let sessionId = null;
+  let ws = null;
+  let currentState = null;
+  let isPaused = false;
+  let wsReconnectTimer = null;
+  let wsReconnectAttempt = 0;
+  const WS_MAX_RECONNECT = 5;
+
+  const $ = (sel) => document.querySelector(sel);
+
+  // ── UI Helpers ──
+  function setStatus(text, cls) {
+    const badge = $("#status-badge");
+    badge.textContent = text;
+    badge.className = cls || "";
+  }
+
+  function setStateLabel(state) {
+    currentState = state;
+    $("#state-label").textContent = `State: ${state}`;
+    updateCommandButtons();
+  }
+
+  /**
+   * Enable/disable command buttons based on current FSM state.
+   * Rules from engine.py _validate_command():
+   *   pause       → blocked during WRAPPING, blocked if already paused
+   *   resume      → only when paused
+   *   skip_question → only in ASKING or LISTENING
+   *   end_interview → blocked during WRAPPING
+   *   extend_5min → always valid (no server-side validation)
+   * All commands blocked in terminal states (ENDED, ERROR).
+   */
+  function updateCommandButtons() {
+    const terminal = currentState === "ENDED" || currentState === "ERROR";
+    const active = sessionId && !terminal;
+
+    $("#cmd-pause").disabled    = !active || isPaused || currentState === "WRAPPING";
+    $("#cmd-resume").disabled   = !active || !isPaused;
+    $("#cmd-skip").disabled     = !active || !(currentState === "ASKING" || currentState === "LISTENING");
+    $("#cmd-extend").disabled   = !active;
+    $("#cmd-end").disabled      = !active || currentState === "WRAPPING";
+  }
+
+  function addMessage(text, type = "system", extra = {}) {
+    const chat = $("#chat");
+    const div = document.createElement("div");
+    div.className = `msg ${type}`;
+
+    let html = "";
+    if (extra.label) html += `<div class="meta">${esc(extra.label)}</div>`;
+    html += esc(text);
+    if (extra.score !== undefined) {
+      html += ` <span class="score-badge">Score: ${extra.score}/10</span>`;
+    }
+    if (extra.feedback) {
+      html += `<div style="margin-top:6px;font-size:12px;opacity:.7">${esc(extra.feedback)}</div>`;
+    }
+    div.innerHTML = html;
+    chat.appendChild(div);
+    chat.scrollTop = chat.scrollHeight;
+  }
+
+  function esc(s) {
+    const d = document.createElement("div");
+    d.textContent = String(s);
+    return d.innerHTML;
+  }
+
+  function setInputEnabled(enabled) {
+    $("#msg-input").disabled = !enabled;
+    $("#send-btn").disabled = !enabled;
+    if (enabled) $("#msg-input").focus();
+  }
+
+  function apiUrl(path) {
+    return $("#api-url").value.replace(/\/+$/, "") + path;
+  }
+
+  function wsUrl(path) {
+    const base = $("#api-url").value.replace(/\/+$/, "");
+    return base.replace(/^http/, "ws") + path;
+  }
+
+  // ── Create Session ──
+  // The FSM auto-starts on creation (no separate "start" command needed).
+  // Flow: create session → connect WebSocket → FSM runs automatically
+  //   WAITING → INTRO (greeting) → ASKING (question) → LISTENING (wait for answer) → …
+  async function createSession() {
+    // Guard: prevent duplicate session creation
+    if (sessionId) {
+      addMessage("⚠ Session already active. Reload page to start a new one.", "system");
+      return;
+    }
+
+    const btn = $("#create-btn");
+    btn.disabled = true;
+
+    try {
+      const body = {
+        candidate_id: $("#candidate-id").value.trim() || "test-candidate-1",
+        job_id: $("#job-id").value.trim() || "test-job-1",
+        meeting_url: "https://test.daily.co/test-room",
+        meeting_type: $("#meeting-type").value,
+        schedule_time: new Date().toISOString(),
+      };
+
+      addMessage("Creating session…");
+      const res = await fetch(apiUrl("/api/v1/sessions"), {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(body),
+      });
+
+      if (!res.ok) {
+        const err = await res.json().catch(() => ({}));
+        throw new Error(err.detail || `HTTP ${res.status}`);
+      }
+
+      const data = await res.json();
+      sessionId = data.session_id;
+
+      addMessage(`✅ Session created: ${sessionId}`);
+      setStatus("Connecting…", "waiting");
+
+      // Show controls bar
+      $("#controls").style.display = "flex";
+
+      // Connect WebSocket to receive live events (questions, state changes, etc.)
+      connectWebSocket();
+    } catch (err) {
+      addMessage(`❌ Failed to create session: ${err.message}`, "system");
+      setStatus("Error", "error");
+      btn.disabled = false;
+    }
+  }
+
+  // ── WebSocket ──
+  let wsPingInterval = null;
+
+  function connectWebSocket() {
+    if (ws) {
+      ws.onclose = null; // prevent reconnect loop
+      ws.close();
+    }
+    clearTimeout(wsReconnectTimer);
+    clearInterval(wsPingInterval);
+
+    const url = wsUrl(`/api/v1/sessions/${sessionId}/live`);
+    ws = new WebSocket(url);
+
+    ws.onopen = () => {
+      wsReconnectAttempt = 0;
+      addMessage("✅ WebSocket connected — waiting for interview to start…");
+      setStatus("Connected", "connected");
+
+      // Send keepalive pings every 25s to prevent idle-timeout closures.
+      // The backend echoes back {"event":"pong","payload":{}} .
+      wsPingInterval = setInterval(() => {
+        if (ws && ws.readyState === WebSocket.OPEN) {
+          ws.send("ping");
+        }
+      }, 25000);
+    };
+
+    ws.onmessage = (evt) => {
+      try {
+        const envelope = JSON.parse(evt.data);
+        handleEvent(envelope);
+      } catch {
+        addMessage(`WS: ${evt.data}`, "system");
+      }
+    };
+
+    ws.onclose = (evt) => {
+      clearInterval(wsPingInterval);
+
+      const isTerminal = currentState === "ENDED" || currentState === "ERROR";
+      if (isTerminal) {
+        addMessage(`WebSocket closed (session ${currentState}).`);
+        setStatus(currentState, currentState === "ERROR" ? "error" : "");
+        return;
+      }
+
+      addMessage(`WebSocket closed (code ${evt.code}).`);
+      setStatus("Disconnected", "error");
+
+      // Auto-reconnect with exponential backoff
+      if (sessionId && wsReconnectAttempt < WS_MAX_RECONNECT) {
+        wsReconnectAttempt++;
+        const delay = Math.min(1000 * Math.pow(2, wsReconnectAttempt - 1), 16000);
+        addMessage(`Reconnecting in ${delay / 1000}s (attempt ${wsReconnectAttempt}/${WS_MAX_RECONNECT})…`);
+        wsReconnectTimer = setTimeout(connectWebSocket, delay);
+      } else if (wsReconnectAttempt >= WS_MAX_RECONNECT) {
+        addMessage("❌ Max reconnection attempts reached. Reload page to retry.", "system");
+      }
+    };
+
+    ws.onerror = () => {
+      // onclose will fire after this — reconnect logic lives there
+    };
+  }
+
+  // ── Handle WebSocket Events ──
+  function handleEvent(envelope) {
+    const { event, payload } = envelope;
+
+    switch (event) {
+
+      case "session_snapshot":
+        // Initial snapshot sent on WS connect
+        setStateLabel(payload.state);
+        addMessage(`Snapshot → state: ${payload.state}, question #${payload.current_question_number}`, "system");
+        break;
+
+      case "state_changed": {
+        // The engine uses {from, to, reason} in _transition_state
+        // but websocket_hub.py helper uses {old_state, new_state}
+        // Handle both shapes:
+        const fromState = payload.from || payload.old_state || "?";
+        const toState   = payload.to   || payload.new_state || "?";
+        const reason    = payload.reason || "";
+
+        setStateLabel(toState);
+        addMessage(`${fromState} → ${toState}  ${reason ? "(" + reason + ")" : ""}`, "system");
+
+        if (toState === "LISTENING") {
+          setInputEnabled(true);
+          setStatus("Listening — type your answer", "connected");
+        } else {
+          setInputEnabled(false);
+        }
+
+        if (toState === "ENDED" || toState === "ERROR") {
+          setStatus(toState, toState === "ERROR" ? "error" : "");
+          setInputEnabled(false);
+        }
+        break;
+      }
+
+      case "greeting_generated":
+        addMessage(payload.greeting, "ai", { label: "👋 Greeting" });
+        break;
+
+      case "question_asked":
+        addMessage(payload.question, "ai", {
+          label: `📝 Question ${payload.question_number}`,
+        });
+        break;
+
+      // question_delivered comes from the websocket_hub.py helper method
+      case "question_delivered":
+        addMessage(payload.question, "ai", {
+          label: `📝 Question ${payload.question_number}`,
+        });
+        break;
+
+      case "evaluation_completed":
+        addMessage(payload.feedback || "Evaluation done", "ai", {
+          label: `📊 Evaluation (Q${payload.question_number})`,
+          score: payload.score,
+        });
+        break;
+
+      // answer_evaluated comes from the websocket_hub.py helper method
+      case "answer_evaluated":
+        addMessage(payload.feedback || "Evaluated", "ai", {
+          label: "📊 Evaluation",
+          score: payload.score,
+        });
+        break;
+
+      case "score_ready":
+        // Duplicate of evaluation_completed — skip to reduce noise
+        break;
+
+      case "pong":
+      case "answer_received":
+      case "answer_transcribed":
+        // Keepalive pong + server-side confirmations — skip silently
+        break;
+
+      case "session_ended":
+        addMessage("🏁 Interview ended", "system");
+        setStatus("Ended", "");
+        setInputEnabled(false);
+        break;
+
+      case "session_error":
+        addMessage(`❌ Session error: ${payload.error_reason || "unknown"}`, "system");
+        setStatus("Error", "error");
+        setInputEnabled(false);
+        break;
+
+      default:
+        addMessage(`[${event}] ${JSON.stringify(payload)}`, "system");
+    }
+  }
+
+  // ── Submit Answer ──
+  async function sendAnswer() {
+    const input = $("#msg-input");
+    const text = input.value.trim();
+    if (!text || !sessionId) return;
+
+    // Guard: only allowed in LISTENING state
+    if (currentState !== "LISTENING") {
+      addMessage("⚠ Cannot send answer — not in LISTENING state.", "system");
+      return;
+    }
+
+    input.value = "";
+    setInputEnabled(false);
+    addMessage(text, "user");
+    setStatus("Evaluating…", "waiting");
+
+    try {
+      const res = await fetch(apiUrl(`/api/v1/sessions/${sessionId}/answer`), {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ answer: text }),
+      });
+
+      if (!res.ok) {
+        const err = await res.json().catch(() => ({}));
+        throw new Error(err.detail || `HTTP ${res.status}`);
+      }
+
+      // The /answer response contains the same feedback that the WS
+      // evaluation_completed event will deliver. We only show a brief
+      // system confirmation here to avoid duplicate feedback bubbles.
+      const data = await res.json();
+      addMessage(`Answer accepted → next: ${data.next_state}`, "system");
+
+      // Input will be re-enabled when WebSocket broadcasts state_changed → LISTENING
+    } catch (err) {
+      addMessage(`❌ Answer failed: ${err.message}`, "system");
+      setStatus("Error", "error");
+      // Re-enable if still LISTENING so user can retry
+      if (currentState === "LISTENING") setInputEnabled(true);
+    }
+  }
+
+  // ── Recruiter Commands ──
+  async function sendCommand(command) {
+    if (!sessionId) return;
+
+    // Track pause state for button logic
+    if (command === "pause")  isPaused = true;
+    if (command === "resume") isPaused = false;
+    updateCommandButtons();
+
+    try {
+      const res = await fetch(apiUrl(`/api/v1/sessions/${sessionId}/command`), {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ command }),
+      });
+
+      if (!res.ok) {
+        const err = await res.json().catch(() => ({}));
+        // Revert optimistic pause state on failure
+        if (command === "pause")  isPaused = false;
+        if (command === "resume") isPaused = true;
+        updateCommandButtons();
+        throw new Error(err.detail || `HTTP ${res.status}`);
+      }
+
+      const data = await res.json();
+      addMessage(`Command "${data.command}" → state: ${data.state}`, "system");
+    } catch (err) {
+      addMessage(`❌ Command "${command}" failed: ${err.message}`, "system");
+    }
+  }
+</script>
+
+</body>
+</html>
