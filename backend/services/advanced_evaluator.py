@@ -15,8 +15,8 @@ from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from typing import Any
 
-from services.ai_client import AIClient, AIClientConfig
-from utils.logger import get_logger
+from backend.services.ai_client import AIClient, AIClientConfig
+from backend.utils.logger import get_logger
 
 
 # =============================================================================

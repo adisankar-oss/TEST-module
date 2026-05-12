@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 from collections import deque
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -13,16 +14,16 @@ from fastapi import HTTPException, WebSocketDisconnect
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
-from fsm.decision import (
+from backend.fsm.decision import (
     CONFIG_KEY_FOLLOWUP_SCORE_MAX,
     CONFIG_KEY_MAX_QUESTIONS,
     CONFIG_KEY_NEXT_SCORE_MIN,
     Decision,
     decide_next_action,
 )
-from fsm.transitions import RecruiterCommand, SessionState, TERMINAL_STATES, validate_transition
-from models import InterviewSession, SessionEvent
-from schemas import (
+from backend.fsm.transitions import RecruiterCommand, SessionState, TERMINAL_STATES, validate_transition
+from backend.models import InterviewSession, SessionEvent
+from backend.schemas import (
     LiveEventEnvelope,
     SessionAnswerResponse,
     SessionCommandResponse,
@@ -31,9 +32,29 @@ from schemas import (
     SessionEventResponse,
     SessionStatusResponse,
 )
-from services.evaluation_service import EvaluationResult, EvaluationService
-from services.question_service import QuestionService
-from utils.logger import get_logger
+from backend.services.candidate_model import CandidateModel
+from backend.services.evaluation_service import EvaluationResult, EvaluationService
+from backend.services.followups.followup_engine import FollowUpEngine
+from backend.services.question_service import QuestionService
+from backend.services.fsm.followup_resolution import (
+    FollowUpResolutionEngine,
+    FollowUpResolutionState,
+)
+
+try:
+    from backend.utils.logger import get_logger as _get_logger
+except Exception:
+    _get_logger = None
+
+
+def get_logger(name: str) -> logging.Logger:
+    if _get_logger is not None:
+        try:
+            return _get_logger(name)
+        except Exception:
+            pass
+    return logging.getLogger(name)
+
 
 
 def utc_now() -> datetime:
@@ -49,6 +70,7 @@ class SessionRuntime:
     skip_question: bool = False
     forced_followup_used: bool = False
     pending_question: str | None = None
+    pending_question_meta: dict[str, Any] | None = None
     pending_topic: str | None = None
     next_difficulty: str = "normal"
     interaction_history: deque[dict[str, Any]] = field(default_factory=lambda: deque(maxlen=3))
@@ -233,9 +255,11 @@ class SessionEngine:
         self._websocket_hub = websocket_hub
         self._question_service = question_service
         self._evaluation_service = evaluation_service
+        self._followup_service = FollowUpEngine()
         self._logger = get_logger("fsm.engine")
         self._tasks: dict[str, asyncio.Task[None]] = {}
         self._runtimes: dict[str, SessionRuntime] = {}
+        self._followup_engines: dict[str, FollowUpResolutionEngine] = {}
         self._task_lock = asyncio.Lock()
 
     async def create_session(self, payload: SessionCreateRequest) -> SessionCreateResponse:
@@ -267,6 +291,7 @@ class SessionEngine:
             await db.commit()
 
         await self._start_session_task(session_id)
+
         return SessionCreateResponse(
             session_id=session_id,
             status="SCHEDULED",
@@ -492,20 +517,23 @@ class SessionEngine:
                 if runtime.pending_question is not None:
                     question = runtime.pending_question
                     runtime.pending_question = None
-                    runtime.pending_topic = None
-                    snapshot.config = dict(snapshot.config or {})
-                    snapshot.config.setdefault("question_history", []).append(
-                        {
-                            "question": question,
-                            "topic": "followup",
-                            "type": "followup",
-                            "reasoning": "followup",
-                            "expected_keywords": [],
-                            "follow_up_hint": "",
-                        }
+                    snapshot.config = self._annotate_question_history(
+                        config=dict(snapshot.config or {}),
+                        question_number=question_number,
+                        question=question,
+                        question_type="followup",
+                        meta=runtime.pending_question_meta,
                     )
+                    runtime.pending_question_meta = None
+                    runtime.pending_topic = None
                 else:
                     question = await self._question_service.generate_question(snapshot)
+                    snapshot.config = self._annotate_question_history(
+                        config=dict(snapshot.config or {}),
+                        question_number=question_number,
+                        question=question,
+                        question_type="harder" if runtime.next_difficulty == "hard" else "new",
+                    )
 
                 await self._store_active_question(session_id, question, snapshot.config)
                 await self._publish_event(
@@ -570,9 +598,18 @@ class SessionEngine:
                         "score": evaluation.score,
                         "feedback": evaluation.feedback,
                         "overall_score": evaluation.overall_score,
+                        "relevance_score": evaluation.relevance_score,
+                        "depth_score": evaluation.depth_score,
+                        "technical_score": evaluation.technical_score,
+                        "communication_score": evaluation.communication_score,
                         "red_flags": evaluation.red_flags,
                         "needs_followup": evaluation.needs_followup,
+                        "followup_required": evaluation.followup_required,
                         "followup_reason": evaluation.followup_reason,
+                        "followup_priority": evaluation.followup_priority,
+                        "missing_dimensions": evaluation.missing_dimensions,
+                        "followup_type": evaluation.followup_type,
+                        "semantic_topic": evaluation.semantic_topic,
                     },
                 )
                 await self._publish_event(
@@ -583,24 +620,43 @@ class SessionEngine:
                         "score": evaluation.score,
                         "feedback": evaluation.feedback,
                         "overall_score": evaluation.overall_score,
+                        "relevance_score": evaluation.relevance_score,
+                        "depth_score": evaluation.depth_score,
+                        "technical_score": evaluation.technical_score,
+                        "communication_score": evaluation.communication_score,
                         "red_flags": evaluation.red_flags,
                         "needs_followup": evaluation.needs_followup,
+                        "followup_required": evaluation.followup_required,
                         "followup_reason": evaluation.followup_reason,
+                        "followup_priority": evaluation.followup_priority,
+                        "missing_dimensions": evaluation.missing_dimensions,
+                        "followup_type": evaluation.followup_type,
+                        "semantic_topic": evaluation.semantic_topic,
                     },
                 )
 
                 await self._record_answer_outcome(
                     session_id=session_id,
                     answer=answer or "",
-                    score=evaluation.score,
-                    feedback=evaluation.feedback,
-                    overall_score=evaluation.overall_score,
-                    red_flags=evaluation.red_flags,
-                    needs_followup=evaluation.needs_followup,
-                    followup_reason=evaluation.followup_reason,
+                    evaluation=evaluation,
                     clear_current_question=True,
                 )
+
+                # Record answer in followup resolution engine
+                current_intent = evaluation.semantic_topic or "general"
+                current_topic = evaluation.semantic_topic or "general"
+                followup_engine = self._followup_engines.get(session_id)
+                if followup_engine:
+                    followup_engine.record_answer(
+                        answer=answer or "",
+                        score=evaluation.score,
+                        intent=current_intent,
+                        topic=current_topic,
+                    )
+
                 await self._transition_state(session_id, SessionState.DECISION, "score_ready")
+                decision_session = await self._get_session(session_id)
+                config = self._session_config(decision_session)
 
                 runtime.interaction_history.append(
                     {
@@ -610,18 +666,28 @@ class SessionEngine:
                         "score": evaluation.score,
                         "feedback": evaluation.feedback,
                         "overall_score": evaluation.overall_score,
+                        "relevance_score": evaluation.relevance_score,
+                        "depth_score": evaluation.depth_score,
+                        "technical_score": evaluation.technical_score,
+                        "communication_score": evaluation.communication_score,
                         "red_flags": evaluation.red_flags,
                         "needs_followup": evaluation.needs_followup,
+                        "followup_required": evaluation.followup_required,
                         "followup_reason": evaluation.followup_reason,
+                        "followup_priority": evaluation.followup_priority,
+                        "missing_dimensions": evaluation.missing_dimensions,
+                        "followup_type": evaluation.followup_type,
+                        "semantic_topic": evaluation.semantic_topic,
                     }
                 )
 
                 decision = self._resolve_decision(
-                    score=evaluation.score,
+                    evaluation=evaluation,
                     question_number=question_number,
                     config=config,
                     runtime=runtime,
-                    session_started_at=snapshot.started_at,
+                    contradiction=self._latest_contradiction(decision_session.config),
+                    session_started_at=decision_session.started_at,
                 )
                 self._logger.info(
                     json.dumps(
@@ -633,7 +699,11 @@ class SessionEngine:
                             "overall_score": evaluation.overall_score,
                             "red_flags": evaluation.red_flags,
                             "needs_followup": evaluation.needs_followup,
+                            "followup_required": evaluation.followup_required,
                             "followup_reason": evaluation.followup_reason,
+                            "followup_priority": evaluation.followup_priority,
+                            "missing_dimensions": evaluation.missing_dimensions,
+                            "followup_type": evaluation.followup_type,
                             "decision": decision,
                             "timestamp": utc_now().isoformat(),
                         }
@@ -657,28 +727,99 @@ class SessionEngine:
                 )
 
                 if decision == Decision.FOLLOWUP.value:
-                    await self._transition_state(session_id, SessionState.FOLLOWUP, "low_score")
-                    runtime.pending_question = await self._question_service.generate_followup(
+                    # Gate FOLLOWUP transition with FollowUpResolutionEngine
+                    current_intent = evaluation.semantic_topic or "general"
+                    current_topic = evaluation.semantic_topic or "general"
+                    followup_engine = self._followup_engines.get(session_id)
+                    if followup_engine:
+                        should, reason = followup_engine.should_followup(
+                            intent=current_intent,
+                            topic=current_topic,
+                        )
+                        if should:
+                            await self._transition_state(session_id, SessionState.FOLLOWUP, "targeted_followup")
+                        else:
+                            self._logger.info(
+                                "FollowUpBlocked reason=%s session=%s",
+                                reason, session_id,
+                            )
+                            # Convert to NEXT decision
+                            decision = Decision.NEXT.value
+                            question_number += 1
+                            runtime.next_difficulty = "normal"
+                            await self._store_session_config(
+                                session_id,
+                                self._followup_service.reset_for_next_question(config),
+                            )
+                            await self._transition_state(session_id, SessionState.ASKING, "next_question")
+                            continue
+                    else:
+                        await self._transition_state(session_id, SessionState.FOLLOWUP, "targeted_followup")
+                    followup_session = await self._get_session(session_id)
+                    followup = self._followup_service.build_followup(
+                        config=dict(followup_session.config or {}),
+                        question_number=question_number,
                         original_question=question,
                         candidate_answer=answer or "",
-                        evaluation_feedback=evaluation.feedback,
-                        context=list(runtime.interaction_history),
+                        evaluation=evaluation,
+                        contradiction=self._latest_contradiction(followup_session.config),
                     )
-                    runtime.next_difficulty = "normal"
-                    await self._transition_state(session_id, SessionState.ASKING, "followup_generated")
-                    continue
+                    await self._store_session_config(session_id, followup.config)
+                    if followup.decision == Decision.FOLLOWUP.value and followup.question:
+                        runtime.pending_question = await self._question_service.generate_followup(
+                            original_question=question,
+                            candidate_answer=answer or "",
+                            evaluation_feedback=evaluation.followup_reason or evaluation.feedback,
+                            context=list(runtime.interaction_history),
+                            contradiction=self._latest_contradiction(followup_session.config),
+                        )
+                        runtime.pending_question_meta = followup.question_meta
+                        runtime.pending_topic = followup.question_meta.get("semantic_topic")
+                        await self._publish_event(
+                            session_id,
+                            "followup_planned",
+                            {
+                                "question_number": question_number,
+                                "followup_reason": evaluation.followup_reason,
+                                "followup_priority": evaluation.followup_priority,
+                                "probe_type": followup.probe_type,
+                                "probe_depth": followup.probe_depth,
+                                "semantic_repeat_score": followup.semantic_repeat_score,
+                                "topic_transition_reason": followup.decision_reason,
+                            },
+                        )
+                        runtime.next_difficulty = "normal"
+                        await self._transition_state(session_id, SessionState.ASKING, "followup_generated")
+                        continue
 
                 if decision == Decision.HARDER.value:
                     question_number += 1
                     runtime.next_difficulty = "hard"
+                    await self._store_session_config(
+                        session_id,
+                        self._followup_service.reset_for_next_question(config),
+                    )
+                    # Reset followup resolution engine for next question
+                    followup_engine = self._followup_engines.get(session_id)
+                    if followup_engine:
+                        followup_engine.reset_for_next_question()
                     await self._transition_state(session_id, SessionState.ASKING, "harder_question")
                     continue
 
                 if decision == Decision.NEXT.value:
                     question_number += 1
                     runtime.next_difficulty = "normal"
+                    await self._store_session_config(
+                        session_id,
+                        self._followup_service.reset_for_next_question(config),
+                    )
+                    # Reset followup resolution engine for next question
+                    followup_engine = self._followup_engines.get(session_id)
+                    if followup_engine:
+                        followup_engine.reset_for_next_question()
                     await self._transition_state(session_id, SessionState.ASKING, "next_question")
                     continue
+
 
                 runtime.next_difficulty = "normal"
                 await self._transition_state(session_id, SessionState.WRAPPING, "decision_wrap")
@@ -755,12 +896,7 @@ class SessionEngine:
         *,
         session_id: str,
         answer: str,
-        score: int,
-        feedback: str,
-        overall_score: int | None,
-        red_flags: list[str],
-        needs_followup: bool,
-        followup_reason: str,
+        evaluation: EvaluationResult,
         clear_current_question: bool,
     ) -> None:
         async with self._session_factory() as db:
@@ -770,13 +906,42 @@ class SessionEngine:
             if isinstance(history, list) and history:
                 latest = dict(history[-1])
                 latest["answer"] = answer
-                latest["score"] = score
-                latest["feedback"] = feedback
-                latest["overall_score"] = overall_score
-                latest["red_flags"] = list(red_flags)
-                latest["needs_followup"] = needs_followup
-                latest["followup_reason"] = followup_reason
+                latest["score"] = evaluation.score
+                latest["feedback"] = evaluation.feedback
+                latest["overall_score"] = evaluation.overall_score
+                latest["relevance_score"] = evaluation.relevance_score
+                latest["depth_score"] = evaluation.depth_score
+                latest["technical_score"] = evaluation.technical_score
+                latest["communication_score"] = evaluation.communication_score
+                latest["red_flags"] = list(evaluation.red_flags)
+                latest["needs_followup"] = evaluation.needs_followup
+                latest["followup_required"] = evaluation.followup_required
+                latest["followup_reason"] = evaluation.followup_reason
+                latest["followup_priority"] = evaluation.followup_priority
+                latest["missing_dimensions"] = list(evaluation.missing_dimensions)
+                latest["followup_type"] = evaluation.followup_type
+                latest["semantic_topic"] = evaluation.semantic_topic
                 history[-1] = latest
+
+                candidate_model = CandidateModel.from_dict(config.get("candidate_model"))
+                candidate_update = candidate_model.update_from_evaluation(
+                    question=latest.get("question", ""),
+                    answer=answer,
+                    topic=latest.get("topic", ""),
+                    technical_score=evaluation.technical_score,
+                    depth_score=evaluation.depth_score,
+                    communication_score=evaluation.communication_score,
+                    history=history[:-1],
+                )
+                latest["candidate_model_update"] = candidate_update
+                history[-1] = latest
+                config["candidate_model"] = candidate_model.to_dict()
+                config = self._followup_service.sync_memory_after_answer(
+                    config=config,
+                    evaluation=evaluation,
+                    contradiction=candidate_model.latest_contradiction(),
+                )
+
                 config["question_history"] = history[-10:]
                 session.config = config
             if clear_current_question:
@@ -839,8 +1004,11 @@ class SessionEngine:
 
     async def _publish_event(self, session_id: str, event: str, payload: dict[str, Any]) -> None:
         async with self._session_factory() as db:
+            session = await self._get_session_for_update(db, session_id)
+            payload["followup_resolution"] = dict(session.config or {}).get("followup_memory", {})
             await self._append_event(db, session_id, event, payload)
             await db.commit()
+
         await self._websocket_hub.broadcast(
             session_id,
             LiveEventEnvelope(event=event, payload=payload),
@@ -930,10 +1098,11 @@ class SessionEngine:
     def _resolve_decision(
         self,
         *,
-        score: int,
+        evaluation: EvaluationResult,
         question_number: int,
-        config: dict[str, int],
+        config: dict[str, Any],
         runtime: SessionRuntime,
+        contradiction: str | None,
         session_started_at: datetime | None,
     ) -> str:
         max_questions = config[CONFIG_KEY_MAX_QUESTIONS]
@@ -950,7 +1119,19 @@ class SessionEngine:
             elapsed_seconds = int((utc_now() - session_started_at).total_seconds())
             if elapsed_seconds >= config["max_duration_minutes"] * 60:
                 return Decision.WRAPPING.value
-        return decide_next_action(score, question_number, config)
+        candidate_model = CandidateModel.from_dict(config.get("candidate_model"))
+        base_decision = decide_next_action(evaluation.score, question_number, config)
+        if base_decision == Decision.NEXT.value and candidate_model.recommended_difficulty() == "harder":
+            base_decision = Decision.HARDER.value
+        decision, _ = self._followup_service.determine_next_action(
+            base_decision=base_decision,
+            config=config,
+            evaluation=evaluation,
+            question_number=question_number,
+            max_questions=max_questions,
+            contradiction=contradiction,
+        )
+        return decision
 
     async def _evaluate_answer(
         self,
@@ -966,15 +1147,77 @@ class SessionEngine:
                 score=3,
                 feedback="Forced follow-up test.",
                 overall_score=24,
+                relevance_score=8,
+                depth_score=6,
+                technical_score=6,
+                communication_score=4,
                 red_flags=["forced_followup_test"],
                 needs_followup=True,
-                followup_reason="Forced follow-up test mode is active.",
+                followup_required=True,
+                followup_reason="INCOMPLETE_EXPLANATION",
+                followup_priority="HIGH",
+                missing_dimensions=["depth", "specificity"],
+                followup_type="clarification_probe",
+                semantic_topic="general",
             )
         return await self._evaluation_service.evaluate_answer(
             question=question,
             answer=answer,
             context=list(runtime.interaction_history),
         )
+
+    async def _store_session_config(self, session_id: str, config: dict[str, Any]) -> None:
+        async with self._session_factory() as db:
+            session = await self._get_session_for_update(db, session_id)
+            config = dict(config or {})
+            # Persist followup resolution state
+            followup_engine = self._followup_engines.get(session_id)
+            if followup_engine:
+                config["followup_resolution"] = followup_engine.to_dict()
+            session.config = config
+            await db.commit()
+
+    def _annotate_question_history(
+        self,
+        *,
+        config: dict[str, Any],
+        question_number: int,
+        question: str,
+        question_type: str,
+        meta: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        config = dict(config or {})
+        history = config.get("question_history", [])
+        if not isinstance(history, list):
+            history = []
+
+        latest = dict(history[-1]) if history and isinstance(history[-1], dict) else {}
+        if latest.get("question") != question or latest.get("answer"):
+            latest = {"question": question, "answer": "", "score": None}
+            history.append(latest)
+
+        meta = dict(meta or {})
+        latest["question_id"] = latest.get("question_id") or meta.get("question_id") or self._question_id(question_number, question)
+        latest["type"] = question_type
+        latest["topic"] = latest.get("topic") or meta.get("topic") or meta.get("semantic_topic") or ""
+        latest["root_question_id"] = meta.get("root_question_id") or latest.get("root_question_id")
+        latest["followup_chain_id"] = meta.get("followup_chain_id") or latest.get("followup_chain_id")
+        latest["probe_reason"] = meta.get("probe_reason") or latest.get("probe_reason")
+        latest["probe_type"] = meta.get("probe_type") or latest.get("probe_type")
+        latest["probe_depth"] = meta.get("probe_depth", latest.get("probe_depth"))
+        latest["semantic_topic"] = meta.get("semantic_topic") or latest.get("semantic_topic") or latest.get("topic", "")
+        history[-1] = latest
+        config["question_history"] = history[-10:]
+        return config
+
+    @staticmethod
+    def _question_id(question_number: int, question: str) -> str:
+        return f"q{question_number}_{abs(hash(question)) % 10000}"
+
+    @staticmethod
+    def _latest_contradiction(config: dict[str, Any]) -> str | None:
+        candidate_model = CandidateModel.from_dict(dict(config or {}).get("candidate_model"))
+        return candidate_model.latest_contradiction()
 
     async def _get_session(self, session_id: str) -> InterviewSession:
         async with self._session_factory() as db:
@@ -1028,6 +1271,11 @@ class SessionEngine:
         if runtime is None:
             runtime = SessionRuntime(session_id=session_id)
             self._runtimes[session_id] = runtime
+        # Initialize followup engine for this session if not exists
+        if session_id not in self._followup_engines:
+            self._followup_engines[session_id] = FollowUpResolutionEngine(
+                FollowUpResolutionState(session_id=session_id)
+            )
         return runtime
 
     def _cleanup_runtime(self, session_id: str) -> None:

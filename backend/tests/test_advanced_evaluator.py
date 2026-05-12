@@ -11,7 +11,7 @@ import json
 import pytest
 from unittest.mock import MagicMock, AsyncMock, patch
 
-from services.advanced_evaluator import (
+from backend.services.advanced_evaluator import (
     AdvancedAnswerEvaluator,
     EvaluationResult,
     RELEVANCE_MAX,

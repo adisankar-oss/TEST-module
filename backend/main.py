@@ -3,18 +3,23 @@ from __future__ import annotations
 import importlib.util
 from contextlib import asynccontextmanager
 
+# Load .env before any other module reads os.environ
+from backend.config.env_loader import load_env
+load_env()
+
 from fastapi import Depends, FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
-from database import AsyncSessionFactory, close_database, init_database
-from dependencies import get_session_engine
-from fsm.engine import SessionEngine
-from fsm.websocket_hub import WebSocketHub
-from fsm.transitions import RecruiterCommand
-from models import Base
-from routes import router as ws_router
-from schemas import (
+from backend.database import AsyncSessionFactory, close_database, init_database
+from backend.dependencies import get_session_engine
+from backend.fsm.engine import SessionEngine
+from backend.fsm.websocket_hub import WebSocketHub
+from backend.fsm.transitions import RecruiterCommand
+from backend.models import Base
+from backend.routes import router as ws_router
+from backend.api.health import router as health_router
+from backend.schemas import (
     SessionAnswerRequest,
     SessionAnswerResponse,
     SessionCommandRequest,
@@ -24,10 +29,11 @@ from schemas import (
     SessionEventResponse,
     SessionStatusResponse,
 )
-from services.ai_client import AIClient
-from services.evaluation_service import EvaluationService
-from services.question_service import QuestionService
-from utils.logger import configure_logging, get_logger
+from backend.services.ai_client import AIClient
+from backend.services.evaluation_service import EvaluationService
+from backend.services.llm.task_router import get_task_router
+from backend.services.question_service import QuestionService
+from backend.utils.logger import configure_logging, get_logger
 
 
 def websocket_runtime_available() -> bool:
@@ -39,10 +45,35 @@ def websocket_runtime_available() -> bool:
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    import sys, os, logging
+
+    # Startup diagnostics
+    startup_logger = logging.getLogger(__name__)
+    startup_logger.info(
+        "StartupEnvironment project_root=%s "
+        "python=%s cwd=%s",
+        os.path.abspath(os.path.join(os.path.dirname(__file__), "..")),
+        sys.version.split()[0],
+        os.getcwd(),
+    )
+
     configure_logging()
     logger = get_logger("main")
+
+    # Load settings after env is loaded
+    from backend.config.settings import settings
+    from backend.config.provider_validator import ProviderValidator
+    from backend.config.startup_checks import run_startup_checks
+
+    logger.info("AppStartup version=%s env=%s", settings.APP_VERSION, settings.APP_ENV)
+
+    # Validate provider configuration at startup
+    ProviderValidator().validate_all()
+    await run_startup_checks()
+
     await init_database(Base.metadata)
     ai_client = AIClient()
+    task_router = get_task_router()
 
     if not websocket_runtime_available():
         logger.warning(
@@ -54,8 +85,8 @@ async def lifespan(app: FastAPI):
     app.state.session_engine = SessionEngine(
         session_factory=AsyncSessionFactory,
         websocket_hub=WebSocketHub(),
-        question_service=QuestionService(ai_client=ai_client),
-        evaluation_service=EvaluationService(),
+        question_service=QuestionService(ai_client=ai_client, task_router=task_router),
+        evaluation_service=EvaluationService(task_router=task_router),
     )
 
     yield
@@ -70,6 +101,10 @@ app = FastAPI(
     lifespan=lifespan,
 )
 
+# Request ID tracking middleware (must be first)
+from backend.core.middleware import RequestIDMiddleware
+app.add_middleware(RequestIDMiddleware)
+
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -80,6 +115,9 @@ app.add_middleware(
 
 # Include WebSocket routes
 app.include_router(ws_router)
+
+# Include health check routes
+app.include_router(health_router)
 
 
 @app.get("/")

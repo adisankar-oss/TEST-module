@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from services.question_bank_service import AdaptiveQuestionService
+from backend.services.question_bank_service import AdaptiveQuestionService
 
 _service = AdaptiveQuestionService()
 

@@ -7,8 +7,9 @@ import re
 from concurrent.futures import ThreadPoolExecutor
 from typing import Any
 
-from services.ai_client import AIClient, AIClientConfig, DEFAULT_MODEL
-from utils.logger import get_logger
+from backend.services.followups.followup_classifier import FollowUpClassifier
+from backend.services.ai_client import AIClient, AIClientConfig, DEFAULT_MODEL
+from backend.utils.logger import get_logger
 
 
 MIN_ANSWER_WORDS = 20
@@ -41,6 +42,7 @@ class AnswerEvaluator:
                 model=self._resolve_model(),
             )
         )
+        self._followup_classifier = FollowUpClassifier()
         self._logger = get_logger("services.answer_evaluator")
 
     def evaluate(
@@ -60,6 +62,7 @@ class AnswerEvaluator:
         if not normalized_question or not normalized_answer:
             return self._post_process_scores(
                 fallback,
+                question=normalized_question,
                 answer=normalized_answer,
                 keywords=normalized_keywords,
                 role_level=normalized_role_level,
@@ -88,6 +91,7 @@ class AnswerEvaluator:
 
         return self._post_process_scores(
             parsed,
+            question=normalized_question,
             answer=normalized_answer,
             keywords=normalized_keywords,
             role_level=normalized_role_level,
@@ -129,7 +133,10 @@ class AnswerEvaluator:
             '  "red_flags": [],\n'
             '  "brief_feedback": "",\n'
             '  "needs_followup": false,\n'
-            '  "followup_reason": ""\n'
+            '  "followup_reason": "",\n'
+            '  "followup_required": false,\n'
+            '  "followup_priority": "LOW",\n'
+            '  "missing_dimensions": []\n'
             "}"
         )
 
@@ -166,6 +173,7 @@ class AnswerEvaluator:
         self,
         payload: dict[str, Any],
         *,
+        question: str,
         answer: str,
         keywords: list[str],
         role_level: str,
@@ -209,10 +217,26 @@ class AnswerEvaluator:
         if not feedback:
             feedback = FALLBACK_FEEDBACK
 
+        followup = self._followup_classifier.classify(
+            question=question,
+            answer=answer,
+            relevance_score=relevance,
+            depth_score=depth,
+            technical_score=technical,
+            communication_score=communication,
+            red_flags=red_flags,
+            contradiction="The answer appears inconsistent with an earlier claim." if "contradiction" in red_flags else None,
+        )
         if not followup_reason:
-            followup_reason = self._derive_followup_reason(red_flags, keyword_overlap, overall_score)
+            followup_reason = followup.followup_reason or self._derive_followup_reason(red_flags, keyword_overlap, overall_score)
 
-        needs_followup = needs_followup or bool(red_flags) or overall_score < 55 or len(keyword_overlap) == 0
+        needs_followup = (
+            needs_followup
+            or followup.followup_required
+            or bool(red_flags)
+            or overall_score < 55
+            or len(keyword_overlap) == 0
+        )
 
         return {
             "relevance_score": relevance,
@@ -223,7 +247,12 @@ class AnswerEvaluator:
             "overall_score": overall_score,
             "brief_feedback": feedback,
             "needs_followup": needs_followup,
-            "followup_reason": followup_reason,
+            "followup_required": needs_followup,
+            "followup_reason": followup.followup_reason or followup_reason,
+            "followup_priority": followup.followup_priority,
+            "missing_dimensions": followup.missing_dimensions,
+            "followup_type": followup.followup_type,
+            "semantic_topic": followup.semantic_topic,
         }
 
     def _generate(self, prompt: str) -> str:
@@ -277,7 +306,12 @@ class AnswerEvaluator:
             "red_flags": [],
             "brief_feedback": FALLBACK_FEEDBACK,
             "needs_followup": True,
-            "followup_reason": "The answer needs more detail and clearer technical evidence.",
+            "followup_required": True,
+            "followup_reason": "INCOMPLETE_EXPLANATION",
+            "followup_priority": "HIGH",
+            "missing_dimensions": ["depth", "specificity"],
+            "followup_type": "clarification_probe",
+            "semantic_topic": "general",
         }
 
     @staticmethod
