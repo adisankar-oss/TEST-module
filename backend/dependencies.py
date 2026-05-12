@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from fastapi import Request, WebSocket
 
-from fsm.engine import SessionEngine
+from backend.fsm.engine import SessionEngine
 
 
 def get_session_engine(request: Request) -> SessionEngine:

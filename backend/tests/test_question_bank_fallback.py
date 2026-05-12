@@ -17,12 +17,12 @@ from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from services.question_bank_service import (
+from backend.services.question_bank_service import (
     AdaptiveQuestionResult,
     AdaptiveQuestionService,
     EvaluationScores,
 )
-from services.question_service import QuestionResult, QuestionService
+from backend.services.question_service import QuestionResult, QuestionService
 
 
 # -----------------------------------------------

@@ -1,21 +1,22 @@
 from __future__ import annotations
 
-import asyncio
 import json
 from collections import Counter
 from dataclasses import asdict, dataclass, field
 from typing import Any
 
-from ai.duplicate_checker import is_duplicate_question
-from ai.llm_client import ask_llm
-from ai.topic_selector import choose_topic
-from services.ai_client import AIClient
-from services.question_bank_service import (
+from backend.ai.duplicate_checker import is_duplicate_question
+from backend.ai.llm_client import ask_llm as ask_llm  # compatibility for existing tests
+from backend.ai.topic_selector import choose_topic
+from backend.services.ai_client import AIClient
+from backend.services.candidate_model import CandidateModel
+from backend.services.llm.task_router import TaskRouter, get_task_router
+from backend.services.question_bank_service import (
     AdaptiveQuestionResult,
     AdaptiveQuestionService,
     EvaluationScores,
 )
-from utils.logger import get_logger
+from backend.utils.logger import get_logger
 
 
 FALLBACK_QUESTION = "Tell me about a challenging system you worked on and the trade-offs you had to make?"
@@ -82,9 +83,11 @@ class QuestionService:
         self,
         ai_client: AIClient | None = None,
         question_bank_service: AdaptiveQuestionService | None = None,
+        task_router: TaskRouter | None = None,
     ) -> None:
         self._ai_client = ai_client or AIClient()
         self._question_bank = question_bank_service or AdaptiveQuestionService()
+        self._task_router = task_router or get_task_router()
         self._logger = get_logger("services.question_service")
 
     async def generate_greeting(
@@ -102,22 +105,9 @@ class QuestionService:
         )
 
         try:
-            greeting = await self._ai_client.generate_text(
-                system_prompt=(
-                    "You are a professional and friendly interviewer representing a top tech company. "
-                    "Your job is to start the interview in a natural, human-like way. "
-                    "Be warm, confident, and professional. Keep it under 120 words, do not output JSON, and end with a question."
-                ),
-                user_prompt=(
-                    f"CANDIDATE NAME: {candidate_id}\n"
-                    f"JOB ROLE: {job_id}\n"
-                    "Greet the candidate by name, introduce yourself as interviewer, "
-                    "mention the role, explain that the interview will mix technical and behavioural discussion, "
-                    "and ask a natural opening question."
-                ),
-                temperature=0.4,
-                max_tokens=120,
-                fallback_text=fallback,
+            greeting, provider = await self._task_router.generate_greeting(
+                candidate_name=candidate_id,
+                role=role,
             )
             cleaned = self._clean_question(greeting)
             if cleaned:
@@ -127,7 +117,8 @@ class QuestionService:
                             "event": "greeting_generated",
                             "candidate_id": candidate_id,
                             "job_id": job_id,
-                            "source": "ai",
+                            "provider": provider,
+                            "source": "llm",
                             "greeting": cleaned,
                         }
                     )
@@ -166,6 +157,7 @@ class QuestionService:
         max_questions = int(getattr(session, "max_questions", 1) or 1)
 
         memory = self._ensure_memory(session)
+        candidate_model = self._candidate_model_for(session)
         questions = memory["questions"]
         previous_questions = [entry.get("question", "") for entry in questions if entry.get("question")]
         covered_topics = [topic for topic in memory["topics"] if topic]
@@ -177,10 +169,15 @@ class QuestionService:
         followup_anchor = self._choose_followup_anchor(last_answer_concepts, concept_counts)
 
         selected_topic = choose_topic(question_number, max_questions, covered_topics)
+        selected_topic = candidate_model.choose_topic(selected_topic, covered_topics)
         if followup_anchor is not None and concept_counts.get(followup_anchor, 0) >= 2:
             followup_anchor = None
         if followup_anchor is None:
             selected_topic = self._force_new_topic(selected_topic, covered_topics)
+            selected_topic = candidate_model.choose_topic(selected_topic, covered_topics)
+
+        recommended_difficulty = candidate_model.recommended_difficulty()
+        avoid_topics = candidate_model.strong_topics_to_avoid()
 
         self._logger.info(
             json.dumps(
@@ -190,6 +187,8 @@ class QuestionService:
                     "question_number": question_number,
                     "topic": selected_topic,
                     "followup_anchor": followup_anchor,
+                    "recommended_difficulty": recommended_difficulty,
+                    "avoid_topics": avoid_topics,
                     "used_concepts": dict(concept_counts),
                 }
             )
@@ -207,28 +206,58 @@ class QuestionService:
             covered_topics=covered_topics,
             used_concepts=memory["concepts"],
             followup_anchor=followup_anchor,
+            candidate_profile={
+                "strengths": candidate_model.strengths[-5:],
+                "weaknesses": candidate_model.weaknesses[-5:],
+                "mentioned_topics": candidate_model.mentioned_topics[-12:],
+                "contradictions": candidate_model.contradictions[-2:],
+                "recommended_difficulty": recommended_difficulty,
+                "avoid_topics": avoid_topics,
+            },
         )
 
         try:
-            raw_response = await asyncio.wait_for(asyncio.to_thread(ask_llm, prompt), timeout=2.0)
-            parsed = self._parse_llm_json(raw_response)
-            candidate_question = self._clean_question(parsed.get("question", ""))
-            question_type = str(parsed.get("type", "new")).strip().lower()
-            question_topic = str(parsed.get("topic", selected_topic)).strip() or selected_topic
+            if self._legacy_llm_is_mocked():
+                parsed = self._parse_llm_json(ask_llm(prompt))
+                candidate_question = self._clean_question(parsed.get("question", ""))
+                question_type = str(parsed.get("type", "new")).strip().lower()
+                question_topic = str(parsed.get("topic", selected_topic)).strip() or selected_topic
+            else:
+                routed = await self._task_router.generate_question(
+                    role=job_id,
+                    difficulty=recommended_difficulty,
+                    question_number=question_number,
+                    max_questions=max_questions,
+                    selected_topic=selected_topic,
+                    previous_questions=previous_questions,
+                    topic_progression=covered_topics,
+                    confidence_scores=self._confidence_scores(memory["questions"]),
+                    followup_history=self._followup_history(session),
+                    candidate_performance={
+                        "last_score": last_score,
+                        "strengths": candidate_model.strengths[-5:],
+                        "weaknesses": candidate_model.weaknesses[-5:],
+                        "mentioned_topics": candidate_model.mentioned_topics[-12:],
+                        "contradictions": candidate_model.contradictions[-2:],
+                        "recommended_difficulty": recommended_difficulty,
+                        "avoid_topics": avoid_topics,
+                    },
+                    session_memory={
+                        "last_answer": last_answer,
+                        "last_turns": questions[-3:],
+                        "followup_anchor": followup_anchor,
+                        "used_concepts": memory["concepts"][-20:],
+                        "prompt_hint": prompt,
+                    },
+                    fallback_question=FALLBACK_QUESTION,
+                )
+                candidate_question = self._clean_question(routed.get("question", ""))
+                question_type = str(routed.get("type", "new")).strip().lower()
+                question_topic = str(routed.get("topic", selected_topic)).strip() or selected_topic
 
             if len(candidate_question) <= MIN_VALID_QUESTION_LENGTH:
                 raise ValueError("Generated question was too short")
             if is_duplicate_question(candidate_question, previous_questions):
-                self._logger.warning(
-                    json.dumps(
-                        {
-                            "event": "duplicate_detection",
-                            "session_id": session_id,
-                            "question": candidate_question,
-                            "result": "duplicate",
-                        }
-                    )
-                )
                 raise ValueError("Generated question duplicated prior history")
             if self._contains_overused_concept(candidate_question, concept_counts):
                 raise ValueError("Generated question reused an overused concept")
@@ -266,11 +295,23 @@ class QuestionService:
             return candidate_question
         except Exception as exc:
             role_level = self._resolve_role_level(session)
-            fallback_question = self._question_bank_fallback(
+            adaptive_result = self._adaptive_fallback(
                 session_id=session_id,
                 topic=selected_topic,
                 role_level=role_level,
                 previous_questions=previous_questions,
+                evaluation_scores=self._history_evaluation_scores(memory["questions"]),
+            )
+
+            # Log a warning about the fallback due to LLM generation failure
+            self._logger.warning(
+                json.dumps(
+                    {
+                        "event": "LLMGenerationFallback",
+                        "session_id": session_id,
+                        "error": str(exc),
+                    }
+                )
             )
 
             self._logger.error(
@@ -283,19 +324,21 @@ class QuestionService:
                         "error": str(exc),
                         "topic": selected_topic,
                         "role_level": role_level,
-                        "question_source": "fallback",
-                        "fallback_question": fallback_question,
+                        "question_source": adaptive_result.source,
+                        "fallback_question": adaptive_result.question,
+                        "difficulty": adaptive_result.difficulty,
+                        "reason": adaptive_result.reason,
                     }
                 )
             )
             self._store_question_memory(
                 session=session,
                 memory=memory,
-                question=fallback_question,
-                topic=selected_topic,
-                concepts=self._extract_concepts(fallback_question),
+                question=adaptive_result.question,
+                topic=adaptive_result.topic,
+                concepts=self._extract_concepts(adaptive_result.question),
             )
-            return fallback_question
+            return adaptive_result.question
 
     async def generate_question_with_fallback(
         self,
@@ -316,6 +359,7 @@ class QuestionService:
         role_level = self._resolve_role_level(session)
 
         memory = self._ensure_memory(session)
+        candidate_model = self._candidate_model_for(session)
         previous_questions = [
             entry.get("question", "")
             for entry in memory["questions"]
@@ -326,36 +370,65 @@ class QuestionService:
         max_questions = int(getattr(session, "max_questions", 1) or 1)
 
         selected_topic = choose_topic(question_number, max_questions, covered_topics)
+        selected_topic = candidate_model.choose_topic(selected_topic, covered_topics)
 
         try:
-            prompt = self._build_dynamic_prompt(
-                job_id=job_id,
-                question_number=question_number,
-                max_questions=max_questions,
-                selected_topic=selected_topic,
-                previous_questions=previous_questions,
-                last_turns=memory["questions"][-3:],
-                last_answer=self._normalize_text(
-                    (memory["questions"][-1] if memory["questions"] else {}).get("answer", "")
-                ),
-                last_score=self._coerce_int(
-                    (memory["questions"][-1] if memory["questions"] else {}).get("score")
-                ),
-                covered_topics=covered_topics,
-                used_concepts=memory["concepts"],
-                followup_anchor=None,
-            )
-
-            raw_response = await asyncio.wait_for(
-                asyncio.to_thread(ask_llm, prompt), timeout=2.0
-            )
-
-            if self._is_llm_failure(raw_response):
-                raise ValueError("LLM response failed validation")
-
-            parsed = self._parse_llm_json(raw_response)
-            candidate = self._clean_question(parsed.get("question", ""))
-            question_topic = str(parsed.get("topic", selected_topic)).strip() or selected_topic
+            if self._legacy_llm_is_mocked():
+                prompt = self._build_dynamic_prompt(
+                    job_id=job_id,
+                    question_number=question_number,
+                    max_questions=max_questions,
+                    selected_topic=selected_topic,
+                    previous_questions=previous_questions,
+                    last_turns=memory["questions"][-3:],
+                    last_answer=self._normalize_text(
+                        (memory["questions"][-1] if memory["questions"] else {}).get("answer", "")
+                    ),
+                    last_score=self._coerce_int(
+                        (memory["questions"][-1] if memory["questions"] else {}).get("score")
+                    ),
+                    covered_topics=covered_topics,
+                    used_concepts=memory["concepts"],
+                    followup_anchor=None,
+                    candidate_profile={
+                        "strengths": candidate_model.strengths[-5:],
+                        "weaknesses": candidate_model.weaknesses[-5:],
+                        "mentioned_topics": candidate_model.mentioned_topics[-12:],
+                        "contradictions": candidate_model.contradictions[-2:],
+                        "recommended_difficulty": candidate_model.recommended_difficulty(),
+                        "avoid_topics": candidate_model.strong_topics_to_avoid(),
+                    },
+                )
+                parsed = self._parse_llm_json(ask_llm(prompt))
+                candidate = self._clean_question(parsed.get("question", ""))
+                question_topic = str(parsed.get("topic", selected_topic)).strip() or selected_topic
+            else:
+                routed = await self._task_router.generate_question(
+                    role=job_id,
+                    difficulty=candidate_model.recommended_difficulty(),
+                    question_number=question_number,
+                    max_questions=max_questions,
+                    selected_topic=selected_topic,
+                    previous_questions=previous_questions,
+                    topic_progression=covered_topics,
+                    confidence_scores=self._confidence_scores(memory["questions"]),
+                    followup_history=self._followup_history(session),
+                    candidate_performance={
+                        "strengths": candidate_model.strengths[-5:],
+                        "weaknesses": candidate_model.weaknesses[-5:],
+                        "mentioned_topics": candidate_model.mentioned_topics[-12:],
+                        "contradictions": candidate_model.contradictions[-2:],
+                        "recommended_difficulty": candidate_model.recommended_difficulty(),
+                        "avoid_topics": candidate_model.strong_topics_to_avoid(),
+                    },
+                    session_memory={
+                        "last_turns": memory["questions"][-3:],
+                        "used_concepts": memory["concepts"][-20:],
+                    },
+                    fallback_question=FALLBACK_QUESTION,
+                )
+                candidate = self._clean_question(routed.get("question", ""))
+                question_topic = str(routed.get("topic", selected_topic)).strip() or selected_topic
 
             if len(candidate) <= MIN_VALID_QUESTION_LENGTH:
                 raise ValueError("LLM question too short after cleaning")
@@ -388,7 +461,6 @@ class QuestionService:
                 topic=question_topic,
                 role_level=role_level,
             )
-
         except Exception as exc:
             fallback_question = self._question_bank_fallback(
                 session_id=session_id,
@@ -450,6 +522,7 @@ class QuestionService:
         scores = self._coerce_evaluation_scores(evaluation_scores)
 
         memory = self._ensure_memory(session)
+        candidate_model = self._candidate_model_for(session)
         previous_questions = [
             entry.get("question", "")
             for entry in memory["questions"]
@@ -460,36 +533,66 @@ class QuestionService:
         max_questions = int(getattr(session, "max_questions", 1) or 1)
 
         selected_topic = choose_topic(question_number, max_questions, covered_topics)
+        selected_topic = candidate_model.choose_topic(selected_topic, covered_topics)
 
         try:
-            prompt = self._build_dynamic_prompt(
-                job_id=job_id,
-                question_number=question_number,
-                max_questions=max_questions,
-                selected_topic=selected_topic,
-                previous_questions=previous_questions,
-                last_turns=memory["questions"][-3:],
-                last_answer=self._normalize_text(
-                    (memory["questions"][-1] if memory["questions"] else {}).get("answer", "")
-                ),
-                last_score=self._coerce_int(
-                    (memory["questions"][-1] if memory["questions"] else {}).get("score")
-                ),
-                covered_topics=covered_topics,
-                used_concepts=memory["concepts"],
-                followup_anchor=None,
-            )
-
-            raw_response = await asyncio.wait_for(
-                asyncio.to_thread(ask_llm, prompt), timeout=2.0
-            )
-
-            if self._is_llm_failure(raw_response):
-                raise ValueError("LLM response failed validation")
-
-            parsed = self._parse_llm_json(raw_response)
-            candidate = self._clean_question(parsed.get("question", ""))
-            question_topic = str(parsed.get("topic", selected_topic)).strip() or selected_topic
+            if self._legacy_llm_is_mocked():
+                prompt = self._build_dynamic_prompt(
+                    job_id=job_id,
+                    question_number=question_number,
+                    max_questions=max_questions,
+                    selected_topic=selected_topic,
+                    previous_questions=previous_questions,
+                    last_turns=memory["questions"][-3:],
+                    last_answer=self._normalize_text(
+                        (memory["questions"][-1] if memory["questions"] else {}).get("answer", "")
+                    ),
+                    last_score=self._coerce_int(
+                        (memory["questions"][-1] if memory["questions"] else {}).get("score")
+                    ),
+                    covered_topics=covered_topics,
+                    used_concepts=memory["concepts"],
+                    followup_anchor=None,
+                    candidate_profile={
+                        "strengths": candidate_model.strengths[-5:],
+                        "weaknesses": candidate_model.weaknesses[-5:],
+                        "mentioned_topics": candidate_model.mentioned_topics[-12:],
+                        "contradictions": candidate_model.contradictions[-2:],
+                        "recommended_difficulty": candidate_model.recommended_difficulty(),
+                        "avoid_topics": candidate_model.strong_topics_to_avoid(),
+                    },
+                )
+                parsed = self._parse_llm_json(ask_llm(prompt))
+                candidate = self._clean_question(parsed.get("question", ""))
+                question_topic = str(parsed.get("topic", selected_topic)).strip() or selected_topic
+            else:
+                routed = await self._task_router.generate_question(
+                    role=job_id,
+                    difficulty=candidate_model.recommended_difficulty(),
+                    question_number=question_number,
+                    max_questions=max_questions,
+                    selected_topic=selected_topic,
+                    previous_questions=previous_questions,
+                    topic_progression=covered_topics,
+                    confidence_scores=self._confidence_scores(memory["questions"]),
+                    followup_history=self._followup_history(session),
+                    candidate_performance={
+                        "strengths": candidate_model.strengths[-5:],
+                        "weaknesses": candidate_model.weaknesses[-5:],
+                        "mentioned_topics": candidate_model.mentioned_topics[-12:],
+                        "contradictions": candidate_model.contradictions[-2:],
+                        "recommended_difficulty": candidate_model.recommended_difficulty(),
+                        "avoid_topics": candidate_model.strong_topics_to_avoid(),
+                        "evaluation_scores": scores.to_dict(),
+                    },
+                    session_memory={
+                        "last_turns": memory["questions"][-3:],
+                        "used_concepts": memory["concepts"][-20:],
+                    },
+                    fallback_question=FALLBACK_QUESTION,
+                )
+                candidate = self._clean_question(routed.get("question", ""))
+                question_topic = str(routed.get("topic", selected_topic)).strip() or selected_topic
 
             if len(candidate) <= MIN_VALID_QUESTION_LENGTH:
                 raise ValueError("LLM question too short after cleaning")
@@ -520,7 +623,6 @@ class QuestionService:
                 topic=question_topic,
                 role_level=role_level,
             )
-
         except Exception as exc:
             adaptive_result = self._adaptive_fallback(
                 session_id=session_id,
@@ -565,42 +667,43 @@ class QuestionService:
         candidate_answer: str,
         evaluation_feedback: str,
         context: list[dict[str, Any]] | None = None,
+        contradiction: str | None = None,
     ) -> str:
         original_question = self._normalize_text(original_question)
         candidate_answer = self._normalize_text(candidate_answer)
         evaluation_feedback = self._normalize_text(evaluation_feedback)
         context = context or []
+
         anchor = self._choose_followup_anchor(self._extract_concepts(candidate_answer), Counter())
 
-        if not all((original_question, candidate_answer, evaluation_feedback)) or anchor is None:
+        if not all((original_question, candidate_answer, evaluation_feedback)):
+            return self._challenge_followup(contradiction) if contradiction else FALLBACK_QUESTION
+        if anchor is None and not contradiction:
             return FALLBACK_QUESTION
 
-        fallback = self._anchored_followup_fallback(anchor)
+        fallback = self._challenge_followup(contradiction) if contradiction else self._anchored_followup_fallback(anchor or "general")
 
         try:
-            followup = await self._ai_client.generate_text(
-                system_prompt=(
-                    "You are an expert interviewer. Generate one real follow-up question. "
-                    "A true follow-up must explicitly reference a concept from the candidate's last answer, "
-                    "go deeper into that exact concept, and avoid generic restatement. "
-                    "Return only the question."
-                ),
-                user_prompt=(
-                    f"Original question: {original_question}\n"
-                    f"Candidate answer: {candidate_answer}\n"
-                    f"Evaluation feedback: {evaluation_feedback}\n"
-                    f"Anchor concept: {anchor}\n"
-                    f"Recent context: {json.dumps(context, ensure_ascii=True)}\n"
-                    "If you cannot ask a true anchored follow-up, return an empty string."
-                ),
-                temperature=0.4,
-                max_tokens=120,
-                fallback_text=fallback,
+            followup = await self._task_router.generate_followup(
+                original_question=original_question,
+                candidate_answer=candidate_answer,
+                evaluation_feedback=evaluation_feedback,
+                followup_reason=evaluation_feedback,
+                session_memory={
+                    "anchor": anchor,
+                    "context": context[-3:],
+                },
+                contradiction=contradiction,
+                recent_followups=[
+                    item.get("question", "")
+                    for item in context
+                    if isinstance(item, dict) and item.get("type") == "followup"
+                ],
             )
             cleaned = self._clean_question(followup)
             if (
                 cleaned
-                and anchor in cleaned.lower()
+                and (contradiction is not None or (anchor is not None and anchor in cleaned.lower()))
                 and cleaned.lower() != original_question.lower()
                 and not any(phrase in cleaned.lower() for phrase in FOLLOWUP_BANNED_PHRASES)
             ):
@@ -721,8 +824,10 @@ class QuestionService:
         covered_topics: list[str],
         used_concepts: list[str],
         followup_anchor: str | None,
+        candidate_profile: dict[str, Any],
+        memory_context: dict | None = None,
     ) -> str:
-        return (
+        base_prompt = (
             "You are a professional technical interviewer conducting a real interview.\n"
             "Your task is to decide the best next question, not just generate a random one.\n"
             "Before generating a question, decide:\n"
@@ -733,6 +838,10 @@ class QuestionService:
             "- If no meaningful anchored follow-up is possible, do not mark the question as follow-up.\n"
             "- Avoid repeating any previous question or concept.\n"
             "- If a concept has already been used twice, avoid it.\n"
+            "- If weaknesses include technical_depth, ask a deeper technical question.\n"
+            "- If recommended difficulty is harder, increase difficulty.\n"
+            "- If recommended difficulty is easier or probe, simplify the framing or probe one core concept.\n"
+            "- Avoid topics listed under Avoid Topics unless you need them for a contradiction challenge.\n"
             "- Return strict JSON only.\n\n"
             f"Job ID: {job_id}\n"
             f"Question Number: {question_number} / {max_questions}\n"
@@ -744,14 +853,41 @@ class QuestionService:
             f"Covered Topics: {json.dumps(covered_topics[-10:], ensure_ascii=True)}\n"
             f"Last Score: {json.dumps(last_score)}\n"
             f"Follow-up Anchor: {json.dumps(followup_anchor)}\n\n"
+            f"Candidate Intelligence: {json.dumps(candidate_profile, ensure_ascii=True)}\n\n"
             "Return JSON with exactly these fields:\n"
             "{\n"
             '  "question": "string",\n'
             '  "type": "followup | new | easier | harder",\n'
             '  "topic": "technical_skills | problem_solving | behavioural | culture_fit | background",\n'
             '  "reasoning": "short internal reasoning"\n'
-            "}"
+            "}\n"
         )
+        try:
+            memory_context = memory_context or {}
+            injections: list[str] = []
+            if memory_context.get("continuity_reference"):
+                injections.append(f"Open with: {memory_context['continuity_reference']}")
+            if memory_context.get("has_unresolved_contradictions"):
+                challenge = memory_context.get("contradiction_challenge")
+                if challenge:
+                    injections.append(f"Challenge the candidate with: {challenge}")
+            elif memory_context.get("urgent_weaknesses"):
+                dims = ", ".join(memory_context.get("urgent_weaknesses", []))
+                injections.append(f"Probe specifically for {dims}. Ask for concrete examples or trade-offs.")
+            elif (
+                memory_context.get("confirmed_strengths")
+                and memory_context.get("recommended_difficulty_shift") == "increase"
+            ):
+                injections.append("Increase question complexity. The candidate is performing well — push deeper.")
+            if memory_context.get("topics_to_avoid"):
+                avoid = ", ".join(memory_context.get("topics_to_avoid", []))
+                injections.append(f"Do not revisit these topics: {avoid}.")
+            if injections:
+                memory_block = "\n".join(injections)
+                return f"{base_prompt}\n\n[INTERVIEW INTELLIGENCE]\n{memory_block}"
+        except Exception:
+            pass
+        return base_prompt
 
     def _parse_llm_json(self, raw_text: str) -> dict[str, Any]:
         trimmed = (raw_text or "").strip()
@@ -851,6 +987,10 @@ class QuestionService:
             return "You mentioned scaling in your answer. What bottleneck became the hardest to manage as load increased?"
         return FALLBACK_QUESTION
 
+    def _challenge_followup(self, contradiction: str) -> str:
+        cleaned = self._normalize_text(contradiction).rstrip(".")
+        return f"{cleaned}. Can you clarify?"
+
     def _question_bank_fallback(
         self,
         *,
@@ -921,6 +1061,58 @@ class QuestionService:
         if isinstance(scores, dict):
             return EvaluationScores.from_dict(scores)
         return EvaluationScores()
+
+    @staticmethod
+    def _history_evaluation_scores(history: list[dict[str, Any]]) -> EvaluationScores:
+        if not history:
+            return EvaluationScores()
+
+        latest = history[-1]
+        return EvaluationScores.from_dict(
+            {
+                "overall_score": latest.get("overall_score"),
+                "depth_score": latest.get("depth_score"),
+                "technical_score": latest.get("technical_score"),
+                "communication_score": latest.get("communication_score"),
+                "relevance_score": latest.get("relevance_score"),
+            }
+        )
+
+    @staticmethod
+    def _confidence_scores(history: list[dict[str, Any]]) -> list[float]:
+        scores: list[float] = []
+        for entry in history:
+            if not isinstance(entry, dict):
+                continue
+            overall = entry.get("overall_score")
+            if overall is None:
+                continue
+            try:
+                scores.append(round(max(0.0, min(1.0, float(overall) / 80.0)), 3))
+            except (TypeError, ValueError):
+                continue
+        return scores[-5:]
+
+    @staticmethod
+    def _followup_history(session: Any) -> list[dict[str, Any]]:
+        config = dict(getattr(session, "config", {}) or {})
+        history = config.get("question_history", [])
+        if not isinstance(history, list):
+            return []
+        return [
+            dict(entry)
+            for entry in history
+            if isinstance(entry, dict) and entry.get("type") == "followup"
+        ][-4:]
+
+    @staticmethod
+    def _legacy_llm_is_mocked() -> bool:
+        return hasattr(ask_llm, "mock_calls")
+
+    @staticmethod
+    def _candidate_model_for(session: Any) -> CandidateModel:
+        config = dict(getattr(session, "config", {}) or {})
+        return CandidateModel.from_dict(config.get("candidate_model"))
 
     @staticmethod
     def _is_llm_failure(response: Any) -> bool:

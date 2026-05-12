@@ -3,7 +3,7 @@ from __future__ import annotations
 from fastapi import APIRouter, Depends, WebSocket
 
 from dependencies import get_session_engine_ws
-from fsm.engine import SessionEngine
+from backend.fsm.engine import SessionEngine
 
 router = APIRouter()
 

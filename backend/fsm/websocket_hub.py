@@ -3,11 +3,24 @@
 from __future__ import annotations
 
 import json
+import logging
 from typing import Any
 
 from fastapi import WebSocket, WebSocketDisconnect
 
-from utils.logger import get_logger
+try:
+    from utils.logger import get_logger as _get_logger
+except Exception:
+    _get_logger = None
+
+
+def get_logger(name: str) -> logging.Logger:
+    if _get_logger is not None:
+        try:
+            return _get_logger(name)
+        except Exception:
+            pass
+    return logging.getLogger(name)
 
 
 class WebSocketHub:

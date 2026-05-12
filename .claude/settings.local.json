@@ -1,7 +1,20 @@
 {
   "permissions": {
     "allow": [
-      "Bash(python -m pytest tests/test_advanced_evaluator.py -v --tb=short)"
+      "Bash(python -m pytest tests/test_advanced_evaluator.py -v --tb=short)",
+      "Bash(Get-ChildItem -Path \"backend/services/interview\" -ErrorAction SilentlyContinue)",
+      "Bash(Select-Object Name)",
+      "Bash(python -c \"import backend; from backend.config.env_loader import load_env; from backend.config.settings import settings; from backend.services.llm.task_router import task_router; from backend.services.realtime.event_bus import event_bus; from backend.services.fsm.followup_resolution import FollowUpResolutionEngine; print\\('All imports resolved successfully'\\); print\\('APP_ENV:', settings.APP_ENV\\)\")",
+      "Bash(pip install *)",
+      "Bash(python -c \"import backend; from backend.config.env_loader import load_env; from backend.config.settings import settings; from backend.services.llm.task_router import TaskRouter; from backend.services.realtime.event_bus import event_bus; from backend.services.fsm.followup_resolution import FollowUpResolutionEngine; print\\('All imports resolved successfully'\\); print\\('APP_ENV:', settings.APP_ENV\\)\")",
+      "Bash(python -m pytest backend/tests/test_imports.py -v)",
+      "Bash(.venv\\\\Scripts\\\\pip install *)",
+      "Bash(python -m pip install google-genai)",
+      "Bash(python -c \"from backend.config.startup_checks import run_startup_checks; import asyncio; asyncio.run\\(run_startup_checks\\(\\)\\)\")",
+      "Bash(python -m uvicorn main:app --host 127.0.0.1 --port 8000 --reload)",
+      "Bash(timeout 30 python -m uvicorn main:app --host 127.0.0.1 --port 8000)",
+      "Bash(python -m pip install groq)",
+      "Bash(python *)"
     ]
   }
 }
